@@ -1,0 +1,692 @@
+{
+  "name": "FlightCheck - Daily Collector",
+  "description": "Searches Google Flights via fli MCP server for watchlist destinations, stores prices in Postgres, logs to Google Sheets, and triggers the Alert Engine.",
+  "nodes": [
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        208,
+        512
+      ],
+      "name": "Manual Trigger"
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Watchlist"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        400,
+        320
+      ],
+      "name": "Read Watchlist",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "YOUR_GOOGLE_SHEETS_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const today = new Date();\nconst runDate = today.toISOString().split('T')[0];\nconst items = $input.all();\nconst pairs = [];\n\nconst enabled = items.filter(i => i.json.enabled === true || i.json.enabled === 'TRUE');\n\nfor (const item of enabled) {\n  const iata = item.json.iata_code;\n  const name = item.json.destination_name;\n\n  for (const weeksOut of [4, 8, 12]) {\n    const d = new Date(today);\n    d.setDate(d.getDate() + weeksOut * 7);\n    const dateStr = d.toISOString().split('T')[0];\n\n    pairs.push({\n      json: {\n        iata_code: iata,\n        destination_name: name,\n        departure_date: dateStr,\n        run_date: runDate\n      }\n    });\n  }\n}\n\nreturn pairs;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        576,
+        320
+      ],
+      "name": "Generate Search Pairs"
+    },
+    {
+      "parameters": {
+        "batchSize": 3,
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        768,
+        320
+      ],
+      "name": "Loop Searches"
+    },
+    {
+      "parameters": {
+        "jsCode": "const item = $json;\nconst baseUrl = 'http://YOUR_FLIGHTCHECK_HOST:8000/mcp';\nconst headers = {\n  'Content-Type': 'application/json',\n  'Accept': 'application/json, text/event-stream'\n};\n\n// Step 1: Initialize MCP session\nconst initRes = await this.helpers.httpRequest({\n  method: 'POST',\n  url: baseUrl,\n  headers,\n  body: {\n    jsonrpc: '2.0',\n    id: 1,\n    method: 'initialize',\n    params: {\n      protocolVersion: '2024-11-05',\n      capabilities: {},\n      clientInfo: { name: 'n8n-flightcheck', version: '1.0.0' }\n    }\n  },\n  returnFullResponse: true,\n  timeout: 30000,\n});\nconst sessionId = initRes.headers['mcp-session-id'];\n\n// Step 2: Send initialized notification\nawait this.helpers.httpRequest({\n  method: 'POST',\n  url: baseUrl,\n  headers: { ...headers, 'mcp-session-id': sessionId },\n  body: {\n    jsonrpc: '2.0',\n    method: 'notifications/initialized'\n  },\n  returnFullResponse: true,\n  timeout: 30000,\n});\n\n// Step 3: Call search_flights\nconst searchRes = await this.helpers.httpRequest({\n  method: 'POST',\n  url: baseUrl,\n  headers: { ...headers, 'mcp-session-id': sessionId },\n  body: {\n    jsonrpc: '2.0',\n    id: 3,\n    method: 'tools/call',\n    params: {\n      name: 'search_flights',\n      arguments: {\n        origin: 'ALB',\n        destination: item.iata_code,\n        departure_date: item.departure_date,\n        cabin_class: 'ECONOMY',\n        passengers: 1\n      }\n    }\n  },\n  returnFullResponse: true,\n  json: false,\n  timeout: 30000,\n});\n\nreturn [{\n  json: {\n    iata_code: item.iata_code,\n    destination_name: item.destination_name,\n    departure_date: item.departure_date,\n    run_date: item.run_date,\n    data: searchRes.body,\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        928,
+        416
+      ],
+      "name": "Search Flights",
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const loopItem = $json;\n\nconst airportCodes = {\n  \"Chicago O'Hare International Airport\": \"ORD\",\n  \"Washington Dulles International Airport\": \"IAD\",\n  \"Denver International Airport\": \"DEN\"\n};\n\nfunction toAirportCode(name) {\n  if (!name) return null;\n  if (airportCodes[name]) return airportCodes[name];\n  if (name.length === 3) return name.toUpperCase();\n  return name;\n}\n\ntry {\n  const rawData = $json.data || $json.body || '';\n\n  let flightData = null;\n  const lines = rawData.split('\\n');\n  for (const line of lines) {\n    const trimmed = line.trim();\n    if (trimmed.startsWith('data: ')) {\n      try {\n        const parsed = JSON.parse(trimmed.substring(6));\n        if (parsed.result && parsed.result.content) {\n          for (const content of parsed.result.content) {\n            if (content.type === 'text' && content.text) {\n              flightData = JSON.parse(content.text);\n            }\n          }\n        }\n      } catch (e) { }\n    }\n  }\n\n  if (!flightData || !flightData.flights || flightData.flights.length === 0) {\n    return [{ json: { ...loopItem,\n      destination_name: loopItem.destination_name.replace(/'/g, \"''\"), price: null, found: false } }];\n  }\n\n  const unitedFlights = flightData.flights.filter(f => {\n    if (!f.legs || f.legs.length === 0) return false;\n    if (f.legs.length > 2) return false;\n    const hasUnited = f.legs.some(leg =>\n      leg.airline && leg.airline.toLowerCase().includes('united')\n    );\n    return hasUnited;\n  });\n\n  if (unitedFlights.length === 0) {\n    return [{ json: { ...loopItem,\n      destination_name: loopItem.destination_name.replace(/'/g, \"''\"), price: null, found: false } }];\n  }\n\n  unitedFlights.sort((a, b) => a.price - b.price);\n  const best = unitedFlights[0];\n\n  const stops = best.legs.length - 1;\n  let layover = null;\n  if (stops === 1 && best.legs.length >= 2) {\n    layover = toAirportCode(best.legs[0].arrival_airport);\n  }\n  const totalDuration = best.legs.reduce((sum, leg) => sum + (leg.duration || 0), 0);\n\n  return [{\n    json: {\n      ...loopItem,\n      destination_name: loopItem.destination_name.replace(/'/g, \"''\"),\n      price: best.price,\n      airline: 'United Airlines',\n      stops: stops,\n      layover_airport: layover,\n      layover_airport_sql: layover ? \"'\" + layover + \"'\" : 'NULL',\n      flight_duration: totalDuration,\n      found: true\n    }\n  }];\n} catch (e) {\n  return [{ json: { ...loopItem,\n      destination_name: loopItem.destination_name.replace(/'/g, \"''\"), price: null, found: false, error: e.message } }];\n}"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        416
+      ],
+      "name": "Parse and Filter"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "found-check",
+              "leftValue": "={{ $json.found }}",
+              "rightValue": true,
+              "operator": {
+                "type": "boolean",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1296,
+        416
+      ],
+      "name": "If Found"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "INSERT INTO flight_prices (run_date, destination_iata, destination_name, price, airline, stops, layover_airport, departure_date, flight_duration) VALUES ('{{ $json.run_date }}', '{{ $json.iata_code }}', '{{ $json.destination_name }}', {{ $json.price }}, '{{ $json.airline }}', {{ $json.stops }}, {{ $json.layover_airport_sql }}, '{{ $json.departure_date }}', {{ $json.flight_duration || 'NULL' }})",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1472,
+        416
+      ],
+      "name": "Write to DB",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CREDENTIAL_ID",
+          "name": "YOUR_POSTGRES_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "workflowId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_ALERT_ENGINE_WORKFLOW_ID"
+        },
+        "workflowInputs": {
+          "mappingMode": "defineBelow",
+          "value": {},
+          "matchingColumns": [],
+          "schema": [],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": true
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.executeWorkflow",
+      "typeVersion": 1.2,
+      "position": [
+        1856,
+        256
+      ],
+      "name": "Trigger Alert Engine"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Daily Summary"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "run_date": "={{ new Date().toISOString().split(\"T\")[0] }}",
+            "routes_checked": "={{ $json.routes_checked }}",
+            "routes_alerted": "={{ $json.routes_alerted }}",
+            "lowest_price_found": "={{ $json.lowest_price_found ?? \"\" }}",
+            "lowest_price_route": "={{ $json.lowest_price_route ?? \"\" }}",
+            "notes": ""
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "run_date",
+              "displayName": "run_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "routes_checked",
+              "displayName": "routes_checked",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "routes_alerted",
+              "displayName": "routes_alerted",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "lowest_price_found",
+              "displayName": "lowest_price_found",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "lowest_price_route",
+              "displayName": "lowest_price_route",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "notes",
+              "displayName": "notes",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1696,
+        256
+      ],
+      "name": "Write Daily Summary",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "YOUR_GOOGLE_SHEETS_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "flightcheck-collector-test",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        208,
+        112
+      ],
+      "name": "Webhook Test Trigger",
+      "webhookId": "flightcheck-collector-test"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT CURRENT_DATE as run_date, COUNT(DISTINCT destination_iata) as routes_checked, MIN(price) as lowest_price_found, (SELECT destination_iata FROM flight_prices WHERE run_date = CURRENT_DATE ORDER BY price ASC LIMIT 1) as lowest_price_route, 0 as routes_alerted FROM flight_prices WHERE run_date = CURRENT_DATE",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1536,
+        256
+      ],
+      "name": "Query Summary",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CREDENTIAL_ID",
+          "name": "YOUR_POSTGRES_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: {} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        928,
+        256
+      ],
+      "name": "Single Item"
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "mode": "id",
+          "value": "YOUR_GOOGLE_SHEET_ID"
+        },
+        "sheetName": {
+          "__rl": true,
+          "mode": "name",
+          "value": "Price History"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "run_date": "={{ $json.run_date }}",
+            "destination_iata": "={{ $json.destination_iata }}",
+            "destination_name": "={{ $json.destination_name }}",
+            "price": "={{ $json.price }}",
+            "airline": "={{ $json.airline }}",
+            "stops": "={{ $json.stops }}",
+            "layover_airport": "={{ $json.layover_airport ?? \"\" }}",
+            "departure_date": "={{ $json.departure_date }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "run_date",
+              "displayName": "run_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "destination_iata",
+              "displayName": "destination_iata",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "destination_name",
+              "displayName": "destination_name",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "price",
+              "displayName": "price",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "airline",
+              "displayName": "airline",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "stops",
+              "displayName": "stops",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "layover_airport",
+              "displayName": "layover_airport",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "departure_date",
+              "displayName": "departure_date",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        1248,
+        256
+      ],
+      "name": "Write Price History",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_GOOGLE_SHEETS_CREDENTIAL_ID",
+          "name": "YOUR_GOOGLE_SHEETS_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT run_date, destination_iata, destination_name, price, airline, stops, layover_airport, departure_date FROM flight_prices WHERE run_date = CURRENT_DATE ORDER BY price ASC",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        1088,
+        256
+      ],
+      "name": "Get Today Results",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CREDENTIAL_ID",
+          "name": "YOUR_POSTGRES_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "return [{ json: {} }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1392,
+        256
+      ],
+      "name": "Single Item 2"
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 14 * * 1,3,5,6"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        208,
+        304
+      ],
+      "name": "Schedule 10AM EST"
+    }
+  ],
+  "connections": {
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Watchlist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Watchlist": {
+      "main": [
+        [
+          {
+            "node": "Generate Search Pairs",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Search Pairs": {
+      "main": [
+        [
+          {
+            "node": "Loop Searches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Searches": {
+      "main": [
+        [
+          {
+            "node": "Single Item",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Flights",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Flights": {
+      "main": [
+        [
+          {
+            "node": "Parse and Filter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse and Filter": {
+      "main": [
+        [
+          {
+            "node": "If Found",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "If Found": {
+      "main": [
+        [
+          {
+            "node": "Write to DB",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Loop Searches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write to DB": {
+      "main": [
+        [
+          {
+            "node": "Loop Searches",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Trigger Alert Engine": {
+      "main": [
+        []
+      ]
+    },
+    "Webhook Test Trigger": {
+      "main": [
+        [
+          {
+            "node": "Read Watchlist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Daily Summary": {
+      "main": [
+        [
+          {
+            "node": "Trigger Alert Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Query Summary": {
+      "main": [
+        [
+          {
+            "node": "Write Daily Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Single Item": {
+      "main": [
+        [
+          {
+            "node": "Get Today Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Price History": {
+      "main": [
+        [
+          {
+            "node": "Single Item 2",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Today Results": {
+      "main": [
+        [
+          {
+            "node": "Write Price History",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Single Item 2": {
+      "main": [
+        [
+          {
+            "node": "Query Summary",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Schedule 10AM EST": {
+      "main": [
+        [
+          {
+            "node": "Read Watchlist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": true,
+    "timeSavedMode": "fixed",
+    "binaryMode": "separate"
+  }
+}

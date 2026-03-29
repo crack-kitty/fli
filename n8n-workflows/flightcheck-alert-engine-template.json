@@ -1,0 +1,360 @@
+{
+  "name": "FlightCheck - Alert Engine",
+  "description": "Analyzes today's flight prices against historical data, detects new all-time lows and significant drops (20%+ below 30-day avg), and sends alerts to Discord.",
+  "nodes": [
+    {
+      "parameters": {
+        "inputSource": "passthrough"
+      },
+      "type": "n8n-nodes-base.executeWorkflowTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        208,
+        320
+      ],
+      "name": "Execute Workflow Trigger"
+    },
+    {
+      "parameters": {},
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [
+        208,
+        480
+      ],
+      "name": "Manual Trigger"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "flightcheck-alert-engine",
+        "responseMode": "lastNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        208,
+        160
+      ],
+      "name": "Webhook Trigger",
+      "webhookId": "flightcheck-alert-engine"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT destination_iata, destination_name, price, stops, layover_airport, departure_date, flight_duration FROM flight_prices WHERE run_date = CURRENT_DATE ORDER BY destination_iata, price",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        384,
+        320
+      ],
+      "name": "Get Today Prices",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CREDENTIAL_ID",
+          "name": "YOUR_POSTGRES_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "check-results",
+              "leftValue": "={{ $json.destination_iata }}",
+              "rightValue": "",
+              "operator": {
+                "type": "string",
+                "operation": "exists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        560,
+        320
+      ],
+      "name": "Check If Results"
+    },
+    {
+      "parameters": {
+        "options": {}
+      },
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        768,
+        304
+      ],
+      "name": "Loop Routes"
+    },
+    {
+      "parameters": {
+        "operation": "executeQuery",
+        "query": "SELECT (SELECT MIN(price) FROM flight_prices WHERE destination_iata = '{{ $json.destination_iata }}' AND run_date < CURRENT_DATE) as all_time_low, (SELECT AVG(price) FROM flight_prices WHERE destination_iata = '{{ $json.destination_iata }}' AND run_date >= CURRENT_DATE - INTERVAL '30 days' AND run_date < CURRENT_DATE) as avg_30d",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgres",
+      "typeVersion": 2.6,
+      "position": [
+        976,
+        400
+      ],
+      "name": "Get Historical Stats",
+      "credentials": {
+        "postgres": {
+          "id": "YOUR_POSTGRES_CREDENTIAL_ID",
+          "name": "YOUR_POSTGRES_CREDENTIAL"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const route = $('Loop Routes').item.json;\nconst stats = $input.item.json;\n\nconst price = parseFloat(route.price);\nconst allTimeLow = stats.all_time_low != null ? parseFloat(stats.all_time_low) : null;\nconst avg30d = stats.avg_30d != null ? parseFloat(stats.avg_30d) : null;\n\nlet alertType = null;\nlet oldLow = allTimeLow;\nlet pctBelow = null;\n\nif (allTimeLow !== null && price < allTimeLow) {\n  alertType = 'new_low';\n}\n\nif (avg30d !== null && price < avg30d * 0.8) {\n  pctBelow = Math.round((1 - price / avg30d) * 100);\n  if (!alertType) alertType = 'significant_drop';\n}\n\nreturn [{\n  json: {\n    destination_iata: route.destination_iata,\n    destination_name: route.destination_name,\n    departure_date: route.departure_date,\n    price: price,\n    stops: route.stops,\n    layover_airport: route.layover_airport,\n    flight_duration: route.flight_duration,\n    all_time_low: allTimeLow,\n    avg_30d: avg30d ? Math.round(avg30d) : null,\n    alert_type: alertType,\n    pct_below: pctBelow\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        400
+      ],
+      "name": "Evaluate Alert"
+    },
+    {
+      "parameters": {
+        "jsCode": "const allItems = $('Evaluate Alert').all();\nconst alerts = allItems.filter(item => item.json.alert_type !== null);\n\nif (alerts.length === 0) {\n  return [{ json: { hasAlerts: false, alerts: [], count: 0 } }];\n}\n\nreturn [{ json: { hasAlerts: true, alerts: alerts.map(a => a.json), count: alerts.length } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        976,
+        208
+      ],
+      "name": "Collect Alerts"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.item.json;\nif (!data.hasAlerts || data.alerts.length === 0) {\n  return [{ json: { skip: true } }];\n}\n\nconst alerts = data.alerts;\nconst today = new Date().toISOString().split('T')[0];\n\nconst messages = [];\nlet current = `\u2708\ufe0f **FlightCheck** \u2014 ${alerts.length} deal${alerts.length > 1 ? 's' : ''} found (${today})\\n`;\n\nfor (const a of alerts) {\n  let line = '';\n  if (a.alert_type === 'new_low') {\n    line = `\ud83d\udd34 NEW LOW  ALB\u2192${a.destination_name} (${a.destination_iata})  **$${a.price}**  prev low $${a.all_time_low || 'n/a'}  via ${a.layover_airport || 'direct'}`;\n  } else {\n    line = `\ud83d\udcc9 -${a.pct_below}%    ALB\u2192${a.destination_name} (${a.destination_iata})  **$${a.price}**  30d avg $${a.avg_30d || 'n/a'}   via ${a.layover_airport || 'direct'}`;\n  }\n  if (a.alert_type === 'new_low' && a.pct_below) {\n    line += ` (${a.pct_below}% below 30d avg)`;\n  }\n\n  if ((current + '\\n' + line).length > 1800) {\n    messages.push(current);\n    current = line;\n  } else {\n    current += '\\n' + line;\n  }\n}\nmessages.push(current);\n\nreturn messages.map(m => ({ json: { content: m } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1136,
+        208
+      ],
+      "name": "Format Discord Message"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "YOUR_DISCORD_WEBHOOK_URL",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ content: $json.content }) }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1520,
+        192
+      ],
+      "name": "Send Discord"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "ead5a2bc-519a-4009-9908-7f2a30136b88",
+              "leftValue": "={{  $json.skip }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "notExists",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        1296,
+        208
+      ],
+      "name": "Has Alerts?"
+    }
+  ],
+  "connections": {
+    "Execute Workflow Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Today Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Manual Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Today Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook Trigger": {
+      "main": [
+        [
+          {
+            "node": "Get Today Prices",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Today Prices": {
+      "main": [
+        [
+          {
+            "node": "Check If Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check If Results": {
+      "main": [
+        [
+          {
+            "node": "Loop Routes",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Loop Routes": {
+      "main": [
+        [
+          {
+            "node": "Collect Alerts",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Get Historical Stats",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Get Historical Stats": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Alert": {
+      "main": [
+        [
+          {
+            "node": "Loop Routes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Collect Alerts": {
+      "main": [
+        [
+          {
+            "node": "Format Discord Message",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Discord Message": {
+      "main": [
+        [
+          {
+            "node": "Has Alerts?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Alerts?": {
+      "main": [
+        [
+          {
+            "node": "Send Discord",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "callerPolicy": "workflowsFromSameOwner",
+    "availableInMCP": true
+  }
+}
