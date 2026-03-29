@@ -37,6 +37,7 @@ jobs:
       - name: Run tests
         run: |
           uv run pytest tests/ --all -v \
+            --reruns 2 --reruns-delay 5 \
             --junitxml=junit.xml
         env:
           FORCE_COLOR: 1

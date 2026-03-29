@@ -24,10 +24,11 @@ class Client:
         "content-type": "application/x-www-form-urlencoded;charset=UTF-8",
     }
 
-    def __init__(self):
+    def __init__(self, timeout: int = 60):
         """Initialize a new client session with default headers."""
         self._client = requests.Session()
         self._client.headers.update(self.DEFAULT_HEADERS)
+        self._client.timeout = timeout
 
     def __del__(self):
         """Clean up client session on deletion."""
