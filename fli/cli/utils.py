@@ -14,6 +14,7 @@ from rich.text import Text
 
 from fli.cli.console import console
 from fli.cli.enums import DayOfWeek
+from fli.core import format_price, format_price_axis_label
 from fli.core.builders import normalize_date
 from fli.core.parsers import ParseError
 from fli.core.parsers import parse_airlines as core_parse_airlines
@@ -170,7 +171,7 @@ def serialize_airport(airport: Airport) -> dict[str, str]:
 
 def serialize_airline(airline: Airline) -> dict[str, str]:
     """Serialize an airline for machine-readable output."""
-    return {"code": airline.name, "name": airline.value}
+    return {"code": airline.name.lstrip("_"), "name": airline.value}
 
 
 def serialize_flight_leg(leg: Any) -> dict[str, Any]:
@@ -195,24 +196,38 @@ def _serialize_flight_segment_result(flight: Any, *, include_price: bool = False
     }
     if include_price:
         payload["price"] = flight.price
-        payload["currency"] = DEFAULT_CURRENCY
+        payload["currency"] = flight.currency or DEFAULT_CURRENCY
     return payload
 
 
 def serialize_flight_result(flight_data: Any) -> dict[str, Any]:
-    """Serialize a flight result or round-trip pair for JSON output."""
-    if isinstance(flight_data, tuple):
-        outbound, return_flight = flight_data
+    """Serialize a flight result or round-trip/multi-city tuple for JSON output."""
+    if not isinstance(flight_data, tuple):
+        return _serialize_flight_segment_result(flight_data, include_price=True)
+
+    segments = list(flight_data)
+
+    if len(segments) == 2:
+        # Round-trip: Google Flights returns the full RT price on the outbound leg.
+        outbound, return_flight = segments
         return {
             "price": outbound.price,
-            "currency": DEFAULT_CURRENCY,
+            "currency": outbound.currency or DEFAULT_CURRENCY,
             "duration": outbound.duration + return_flight.duration,
             "stops": outbound.stops + return_flight.stops,
             "outbound": _serialize_flight_segment_result(outbound),
             "return": _serialize_flight_segment_result(return_flight),
         }
 
-    return _serialize_flight_segment_result(flight_data, include_price=True)
+    # Multi-city (3+ legs): combined price is on the final leg.
+    price_segment = segments[-1]
+    return {
+        "price": price_segment.price,
+        "currency": price_segment.currency or DEFAULT_CURRENCY,
+        "duration": sum(s.duration for s in segments),
+        "stops": sum(s.stops for s in segments),
+        "segments": [_serialize_flight_segment_result(s) for s in segments],
+    }
 
 
 def serialize_date_result(date_result: Any, trip_type: TripType) -> dict[str, Any]:
@@ -221,7 +236,7 @@ def serialize_date_result(date_result: Any, trip_type: TripType) -> dict[str, An
         "departure_date": date_result.date[0].date().isoformat(),
         "return_date": None,
         "price": date_result.price,
-        "currency": DEFAULT_CURRENCY,
+        "currency": date_result.currency or DEFAULT_CURRENCY,
     }
     if trip_type == TripType.ROUND_TRIP and len(date_result.date) > 1:
         payload["return_date"] = date_result.date[1].date().isoformat()
@@ -288,17 +303,20 @@ def display_flight_results(flights: list):
         return
 
     for i, flight_data in enumerate(flights, 1):
-        is_round_trip = isinstance(flight_data, tuple)
-        flight_segments = [flight_data] if not is_round_trip else [flight_data[0], flight_data[1]]
+        is_multi_leg = isinstance(flight_data, tuple)
+        flight_segments = list(flight_data) if is_multi_leg else [flight_data]
+        num_legs = len(flight_segments)
 
         # Create main flight info table
         table = Table(show_header=False, box=box.SIMPLE)
         table.add_column("Label", style="blue")
         table.add_column("Value", style="green")
 
-        # Google Flights returns the full round-trip price on the outbound leg
-        total_price = flight_segments[0].price
-        table.add_row("Total Price", f"${total_price:,.2f}")
+        # Google Flights returns the full trip price on the outbound leg for round-trips,
+        # and on the final leg for multi-city trips.
+        price_segment = flight_segments[-1] if num_legs > 2 else flight_segments[0]
+        total_price = price_segment.price
+        table.add_row("Total Price", format_price(total_price, price_segment.currency))
 
         total_duration = sum(flight.duration for flight in flight_segments)
         table.add_row("Total Duration", format_duration(total_duration))
@@ -308,22 +326,26 @@ def display_flight_results(flights: list):
         # Create segments tables for each direction
         all_segments = []
         for idx, flight in enumerate(flight_segments):
-            direction = "" if not is_round_trip else ("Outbound" if idx == 0 else "Return")
+            if num_legs == 1:
+                direction = ""
+            elif num_legs == 2:
+                direction = "Outbound" if idx == 0 else "Return"
+            else:
+                direction = f"Leg {idx + 1}"
             segments = Table(
                 title=(f"{direction} Flight Segments" if direction else "Flight Segments"),
                 box=box.ROUNDED,
             )
-            segments.add_column("Airline", style="cyan")
-            segments.add_column("Flight", style="magenta")
-            segments.add_column("From", style="yellow", width=30)
-            segments.add_column("Departure", style="green")
-            segments.add_column("To", style="yellow", width=30)
-            segments.add_column("Arrival", style="green")
+            segments.add_column("Flight", style="cyan", no_wrap=True)
+            segments.add_column("From", style="yellow")
+            segments.add_column("Depart", style="green", no_wrap=True)
+            segments.add_column("To", style="yellow")
+            segments.add_column("Arrive", style="green", no_wrap=True)
 
             for leg in flight.legs:
+                airline_flight = f"{leg.airline.name.lstrip('_')} {leg.flight_number}"
                 segments.add_row(
-                    leg.airline.value,
-                    leg.flight_number,
+                    airline_flight,
                     format_airport(leg.departure_airport),
                     leg.departure_datetime.strftime("%H:%M %d-%b"),
                     format_airport(leg.arrival_airport),
@@ -332,7 +354,12 @@ def display_flight_results(flights: list):
             all_segments.extend([segments, Text("")])
 
         # Display in a panel
-        title = "Round-trip Flight" if is_round_trip else "One-way Flight"
+        if num_legs > 2:
+            title = "Multi-city Flight"
+        elif num_legs == 2:
+            title = "Round-trip Flight"
+        else:
+            title = "One-way Flight"
         console.print(
             Panel(
                 Group(
@@ -368,7 +395,7 @@ def display_date_results(dates: list, trip_type: TripType):
     plt.plot(prices, marker="braille")
     plt.title("Price Trend")
     plt.xlabel("Date")
-    plt.ylabel("Price ($)")
+    plt.ylabel(format_price_axis_label(date.currency for date in sorted_dates))
 
     # Set x-axis labels (show subset if too many dates)
     if len(date_labels) <= 10:
@@ -399,7 +426,7 @@ def display_date_results(dates: list, trip_type: TripType):
             table.add_row(
                 date_price.date[0].strftime("%Y-%m-%d"),
                 date_price.date[0].strftime("%A"),
-                f"${date_price.price:,.2f}",
+                format_price(date_price.price, date_price.currency),
             )
         else:
             table.add_row(
@@ -407,7 +434,7 @@ def display_date_results(dates: list, trip_type: TripType):
                 date_price.date[0].strftime("%A"),
                 date_price.date[1].strftime("%Y-%m-%d"),
                 date_price.date[1].strftime("%A"),
-                f"${date_price.price:,.2f}",
+                format_price(date_price.price, date_price.currency),
             )
 
     console.print(table)

@@ -8,6 +8,7 @@ import json
 from copy import deepcopy
 from datetime import datetime
 
+from fli.core import extract_currency_from_price_token
 from fli.models import (
     Airline,
     Airport,
@@ -37,7 +38,7 @@ class SearchFlights:
 
     def search(
         self, filters: FlightSearchFilters, top_n: int = 5
-    ) -> list[FlightResult | tuple[FlightResult, FlightResult]] | None:
+    ) -> list[FlightResult | tuple[FlightResult, ...]] | None:
         """Search for flights using the given FlightSearchFilters.
 
         Args:
@@ -45,10 +46,16 @@ class SearchFlights:
             top_n: Number of flights to limit the return flight search to
 
         Returns:
-            List of FlightResult objects containing flight details, or None if no results
+            List of FlightResult objects (one-way), tuples of FlightResult (round-trip
+            or multi-city), or None if no results
 
         Raises:
             Exception: If the search fails or returns invalid data
+
+        Note:
+            Multi-city searches (TripType.MULTI_CITY) with distinct city pairs may
+            time out due to limitations of the Google Flights API endpoint.  The
+            endpoint reliably supports one-way and round-trip searches.
 
         """
         encoded_filters = filters.encode()
@@ -75,25 +82,34 @@ class SearchFlights:
             ]
             flights = [self._parse_flights_data(flight) for flight in flights_data]
 
-            if (
-                filters.trip_type == TripType.ONE_WAY
-                or filters.flight_segments[0].selected_flight is not None
-            ):
+            if filters.trip_type == TripType.ONE_WAY:
                 return flights
 
-            # Get the return flights if round-trip
-            flight_pairs = []
-            # Call the search again with the return flight data
-            for selected_flight in flights[:top_n]:
-                selected_flight_filters = deepcopy(filters)
-                selected_flight_filters.flight_segments[0].selected_flight = selected_flight
-                return_flights = self.search(selected_flight_filters, top_n=top_n)
-                if return_flights is not None:
-                    flight_pairs.extend(
-                        (selected_flight, return_flight) for return_flight in return_flights
-                    )
+            # For round-trip and multi-city, iteratively select each leg
+            # and fetch the next leg's options with combined pricing.
+            num_segments = len(filters.flight_segments)
+            selected_count = sum(
+                1 for s in filters.flight_segments if s.selected_flight is not None
+            )
 
-            return flight_pairs
+            # If all previous segments are selected, we're on the last leg
+            if selected_count >= num_segments - 1:
+                return flights
+
+            # Select each flight option and fetch the next leg
+            flight_combos = []
+            for selected_flight in flights[:top_n]:
+                next_filters = deepcopy(filters)
+                next_filters.flight_segments[selected_count].selected_flight = selected_flight
+                next_results = self.search(next_filters, top_n=top_n)
+                if next_results is not None:
+                    for next_result in next_results:
+                        if isinstance(next_result, tuple):
+                            flight_combos.append((selected_flight,) + next_result)
+                        else:
+                            flight_combos.append((selected_flight, next_result))
+
+            return flight_combos
 
         except Exception as e:
             raise Exception(f"Search failed: {str(e)}") from e
@@ -109,8 +125,10 @@ class SearchFlights:
             Structured FlightResult object with all flight details
 
         """
+        price, currency = SearchFlights._parse_price_info(data)
         flight = FlightResult(
-            price=SearchFlights._parse_price(data),
+            price=price,
+            currency=currency,
             duration=data[0][9],
             stops=len(data[0][2]) - 1,
             legs=[
@@ -130,7 +148,7 @@ class SearchFlights:
 
     @staticmethod
     def _parse_price(data: list) -> float:
-        """Extract price from raw flight data.
+        """Extract the numeric price from raw flight data.
 
         Args:
             data: Raw flight data from the API response
@@ -140,11 +158,51 @@ class SearchFlights:
 
         """
         try:
-            if data[1] and data[1][0]:
-                return data[1][0][-1]
+            price_block = SearchFlights._get_price_block(data)
+            if price_block and price_block[0]:
+                return float(price_block[0][-1])
         except (IndexError, TypeError):
             pass
         return 0.0
+
+    @staticmethod
+    def _parse_price_info(data: list) -> tuple[float, str | None]:
+        """Extract the numeric price and returned currency from raw flight data."""
+        price_block = SearchFlights._get_price_block(data)
+        price = 0.0
+        currency = None
+        try:
+            if price_block and price_block[0]:
+                price = float(price_block[0][-1])
+        except (IndexError, TypeError):
+            pass
+        try:
+            if price_block and len(price_block) > 1:
+                currency = extract_currency_from_price_token(price_block[1])
+        except (IndexError, TypeError):
+            pass
+        return price, currency
+
+    @staticmethod
+    def _parse_currency(data: list) -> str | None:
+        """Extract the returned currency code from raw flight data."""
+        try:
+            price_block = SearchFlights._get_price_block(data)
+            if price_block and len(price_block) > 1:
+                return extract_currency_from_price_token(price_block[1])
+        except (IndexError, TypeError):
+            pass
+        return None
+
+    @staticmethod
+    def _get_price_block(data: list) -> list | None:
+        """Return the raw price block attached to a flight row."""
+        try:
+            if len(data) > 1 and isinstance(data[1], list):
+                return data[1]
+        except TypeError:
+            pass
+        return None
 
     @staticmethod
     def _parse_datetime(date_arr: list[int], time_arr: list[int]) -> datetime:

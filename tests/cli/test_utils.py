@@ -8,6 +8,7 @@ from typer import BadParameter
 
 from fli.cli.enums import DayOfWeek
 from fli.cli.utils import (
+    display_date_results,
     display_flight_results,
     filter_dates_by_days,
     filter_flights_by_airlines,
@@ -108,6 +109,12 @@ def test_parse_airlines_none():
     assert result is None
 
 
+def test_parse_airlines_numeric_prefix():
+    """Test that airline codes starting with a digit are resolved correctly."""
+    result = parse_airlines(["3F"])
+    assert result == [Airline._3F]
+
+
 def test_parse_airlines_invalid():
     """Test parsing airlines with invalid code."""
     with pytest.raises(BadParameter):
@@ -205,11 +212,14 @@ def test_filter_dates_by_days():
 # ---------------------------------------------------------------------------
 
 
-def _make_flight_result(price: float, airline=Airline.DL, flight_number="DL123") -> FlightResult:
+def _make_flight_result(
+    price: float, airline=Airline.DL, flight_number="DL123", currency: str | None = "USD"
+) -> FlightResult:
     """Create a FlightResult for testing display."""
     now = datetime.now()
     return FlightResult(
         price=price,
+        currency=currency,
         duration=300,
         stops=0,
         legs=[
@@ -235,6 +245,15 @@ def _capture_display(flights: list) -> str:
     return buf.getvalue()
 
 
+def _capture_date_display(dates: list, trip_type: TripType) -> str:
+    """Run display_date_results and capture the rendered text."""
+    buf = StringIO()
+    test_console = Console(file=buf, width=120, force_terminal=True)
+    with patch("fli.cli.utils.console", test_console):
+        display_date_results(dates, trip_type)
+    return buf.getvalue()
+
+
 def test_display_one_way_price():
     """One-way flight should display the flight price as-is."""
     output = _capture_display([_make_flight_result(price=159.0)])
@@ -252,6 +271,21 @@ def test_display_round_trip_price_not_doubled():
     assert "$634.00" not in output
 
 
+def test_display_multi_city_three_legs():
+    """Multi-city (3+ legs) should render without errors, showing final-leg price."""
+    leg1 = _make_flight_result(price=0.0, flight_number="AA100")
+    leg2 = _make_flight_result(price=0.0, flight_number="DL200")
+    leg3 = _make_flight_result(price=800.0, flight_number="UA300")
+
+    output = _capture_display([(leg1, leg2, leg3)])
+
+    assert "$800.00" in output
+    assert "Multi-city Flight" in output
+    assert "Leg 1" in output
+    assert "Leg 2" in output
+    assert "Leg 3" in output
+
+
 def test_display_round_trip_price_asymmetric():
     """When leg prices differ, total should be the outbound price, not the sum."""
     outbound = _make_flight_result(price=400.0)
@@ -261,6 +295,37 @@ def test_display_round_trip_price_asymmetric():
 
     assert "$400.00" in output
     assert "$750.00" not in output
+
+
+def test_display_one_way_price_uses_returned_currency():
+    """One-way flight should use the returned currency code for formatting."""
+    output = _capture_display([_make_flight_result(price=159.0, currency="HKD")])
+    assert "HK$159.00" in output
+
+
+def test_display_date_results_uses_returned_currency():
+    """Date results should render prices using the returned currency."""
+    output = _capture_date_display(
+        [DatePrice(date=(datetime(2026, 5, 1),), price=118.0, currency="EUR")],
+        TripType.ONE_WAY,
+    )
+    assert "€118.00" in output
+
+
+def test_serialize_airline_strips_numeric_prefix():
+    """Numeric-prefix airline codes should not include the underscore in output."""
+    from fli.cli.utils import serialize_airline
+
+    result = serialize_airline(Airline._3F)
+    assert result == {"code": "3F", "name": "FlyOne Armenia"}
+
+
+def test_serialize_airline_normal_code():
+    """Normal airline codes should serialize unchanged."""
+    from fli.cli.utils import serialize_airline
+
+    result = serialize_airline(Airline.BA)
+    assert result == {"code": "BA", "name": "British Airways"}
 
 
 def test_serialize_flight_result_one_way():
@@ -275,6 +340,16 @@ def test_serialize_flight_result_one_way():
     assert payload["legs"][0]["airline"]["code"] == "DL"
 
 
+def test_serialize_flight_result_numeric_prefix_airline():
+    """Numeric-prefix airline codes in flight legs should not have underscore."""
+    flight = _make_flight_result(price=200.0, airline=Airline._3F, flight_number="3F101")
+
+    payload = serialize_flight_result(flight)
+
+    assert payload["legs"][0]["airline"]["code"] == "3F"
+    assert payload["legs"][0]["airline"]["name"] == "FlyOne Armenia"
+
+
 def test_serialize_flight_result_round_trip():
     """Round-trip JSON serialization should expose outbound and return segments."""
     outbound = _make_flight_result(price=317.0, flight_number="DL100")
@@ -286,6 +361,25 @@ def test_serialize_flight_result_round_trip():
     assert payload["currency"] == "USD"
     assert payload["outbound"]["legs"][0]["flight_number"] == "DL100"
     assert payload["return"]["legs"][0]["flight_number"] == "DL200"
+
+
+def test_serialize_flight_result_multi_city():
+    """Multi-city (3+ legs) JSON serialization should not crash."""
+    leg1 = _make_flight_result(price=0.0, flight_number="AA100")
+    leg2 = _make_flight_result(price=0.0, flight_number="DL200")
+    leg3 = _make_flight_result(price=800.0, flight_number="UA300")
+
+    payload = serialize_flight_result((leg1, leg2, leg3))
+
+    # Price comes from the final leg for multi-city
+    assert payload["price"] == 800.0
+    assert payload["currency"] == "USD"
+    assert payload["duration"] == 900  # 300 * 3
+    assert payload["stops"] == 0
+    assert len(payload["segments"]) == 3
+    assert payload["segments"][0]["legs"][0]["flight_number"] == "AA100"
+    assert payload["segments"][1]["legs"][0]["flight_number"] == "DL200"
+    assert payload["segments"][2]["legs"][0]["flight_number"] == "UA300"
 
 
 def test_serialize_date_result_round_trip():
@@ -303,3 +397,35 @@ def test_serialize_date_result_round_trip():
         "price": 599.98,
         "currency": "USD",
     }
+
+
+def test_serialize_flight_result_uses_returned_currency():
+    """JSON flight serialization should preserve the parsed result currency."""
+    flight = _make_flight_result(price=159.0, currency="SEK")
+
+    payload = serialize_flight_result(flight)
+
+    assert payload["currency"] == "SEK"
+
+
+def test_serialize_flight_result_round_trip_uses_returned_currency():
+    """Round-trip JSON serialization should preserve the parsed result currency."""
+    outbound = _make_flight_result(price=2534.0, currency="SEK", flight_number="SK101")
+    return_flight = _make_flight_result(price=2534.0, currency="SEK", flight_number="SK202")
+
+    payload = serialize_flight_result((outbound, return_flight))
+
+    assert payload["currency"] == "SEK"
+
+
+def test_serialize_date_result_uses_returned_currency():
+    """JSON date serialization should preserve the parsed result currency."""
+    result = DatePrice(
+        date=(datetime(2026, 5, 1),),
+        price=118.0,
+        currency="SEK",
+    )
+
+    payload = serialize_date_result(result, TripType.ONE_WAY)
+
+    assert payload["currency"] == "SEK"

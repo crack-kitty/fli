@@ -33,12 +33,14 @@ from fli.core import (
     build_time_restrictions,
     parse_airlines,
     parse_cabin_class,
+    parse_emissions,
     parse_max_stops,
     parse_sort_by,
     resolve_airport,
 )
 from fli.core.parsers import ParseError
 from fli.models import (
+    BagsFilter,
     DateSearchFilters,
     FlightSearchFilters,
     PassengerInfo,
@@ -61,7 +63,7 @@ class FlightSearchConfig(BaseSettings):
         "USD",
         min_length=3,
         max_length=3,
-        description="Three-letter currency code returned with search results.",
+        description="Fallback currency code when Google does not expose one in results.",
     )
     default_cabin_class: str = Field(
         "ECONOMY",
@@ -240,6 +242,17 @@ class FlightSearchParams(BaseModel):
         ge=1,
         description="Number of adult passengers",
     )
+    exclude_basic_economy: bool = Field(
+        False, description="Exclude basic economy fares from results"
+    )
+    emissions: str = Field("ALL", description="Filter by emissions level: ALL or LESS")
+    checked_bags: int = Field(
+        0, ge=0, le=2, description="Number of checked bags to include in price (0, 1, or 2)"
+    )
+    carry_on: bool = Field(False, description="Include carry-on bag fee in displayed price")
+    show_all_results: bool = Field(
+        True, description="Return all available results instead of curated ~30"
+    )
 
 
 class DateSearchParams(BaseModel):
@@ -288,29 +301,42 @@ def _serialize_flight_leg(leg: Any) -> dict[str, Any]:
         "arrival_time": leg.arrival_datetime,
         "duration": leg.duration,
         "airline": leg.airline,
+        "airline_code": getattr(leg.airline, "name", leg.airline).lstrip("_"),
         "flight_number": leg.flight_number,
     }
 
 
 def _serialize_flight_result(flight: Any, is_round_trip: bool = False) -> dict[str, Any]:
-    """Serialize a flight result (or round-trip pair) to a dictionary."""
-    if is_round_trip and isinstance(flight, tuple):
-        outbound, return_flight = flight
+    """Serialize a flight result (or round-trip/multi-city tuple) to a dictionary."""
+    if not isinstance(flight, tuple):
         return {
-            # Google Flights returns the full round-trip price on the outbound leg
+            "price": flight.price,
+            "currency": flight.currency or CONFIG.default_currency,
+            "legs": [_serialize_flight_leg(leg) for leg in flight.legs],
+        }
+
+    segments = list(flight)
+
+    if len(segments) == 2 and is_round_trip:
+        # Google Flights returns the full round-trip price on the outbound leg
+        outbound, return_flight = segments
+        return {
             "price": outbound.price,
-            "currency": CONFIG.default_currency,
+            "currency": outbound.currency or CONFIG.default_currency,
             "legs": [
                 *[_serialize_flight_leg(leg) for leg in outbound.legs],
                 *[_serialize_flight_leg(leg) for leg in return_flight.legs],
             ],
         }
-    else:
-        return {
-            "price": flight.price,
-            "currency": CONFIG.default_currency,
-            "legs": [_serialize_flight_leg(leg) for leg in flight.legs],
-        }
+
+    # Multi-city (3+ legs) or 2-leg non-round-trip: combined price on the
+    # final leg (matches Google Flights pricing and the CLI display logic).
+    price_segment = segments[-1] if len(segments) > 2 else segments[0]
+    return {
+        "price": price_segment.price,
+        "currency": price_segment.currency or CONFIG.default_currency,
+        "legs": [_serialize_flight_leg(leg) for segment in segments for leg in segment.legs],
+    }
 
 
 def _serialize_date_result(date_result: Any) -> dict[str, Any]:
@@ -318,7 +344,7 @@ def _serialize_date_result(date_result: Any) -> dict[str, Any]:
     return {
         "date": date_result.date,
         "price": date_result.price,
-        "currency": CONFIG.default_currency,
+        "currency": date_result.currency or CONFIG.default_currency,
         "return_date": getattr(date_result, "return_date", None),
     }
 
@@ -352,6 +378,12 @@ def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
             time_restrictions=time_restrictions,
         )
 
+        # Parse new filters
+        emissions_filter = parse_emissions(params.emissions)
+        bags_filter = None
+        if params.checked_bags > 0 or params.carry_on:
+            bags_filter = BagsFilter(checked_bags=params.checked_bags, carry_on=params.carry_on)
+
         # Create search filters
         filters = FlightSearchFilters(
             trip_type=trip_type,
@@ -361,6 +393,10 @@ def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
             seat_type=cabin_class,
             airlines=airlines,
             sort_by=sort_by,
+            exclude_basic_economy=params.exclude_basic_economy,
+            emissions=emissions_filter,
+            bags=bags_filter,
+            show_all_results=params.show_all_results,
         )
 
         # Perform search
@@ -505,12 +541,35 @@ def search_flights(
     ] = "ANY",
     sort_by: Annotated[
         str,
-        Field(description="Sort by: CHEAPEST, DURATION, DEPARTURE_TIME, ARRIVAL_TIME"),
+        Field(
+            description="Sort by: TOP_FLIGHTS, BEST, CHEAPEST,"
+            " DEPARTURE_TIME, ARRIVAL_TIME, DURATION, EMISSIONS"
+        ),
     ] = CONFIG.default_sort_by,
     passengers: Annotated[
         int | None,
         Field(description="Number of adult passengers", ge=1),
     ] = None,
+    exclude_basic_economy: Annotated[
+        bool,
+        Field(description="Exclude basic economy fares from results"),
+    ] = False,
+    emissions: Annotated[
+        str,
+        Field(description="Filter by emissions level: ALL or LESS"),
+    ] = "ALL",
+    checked_bags: Annotated[
+        int,
+        Field(description="Number of checked bags to include in price (0, 1, or 2)", ge=0, le=2),
+    ] = 0,
+    carry_on: Annotated[
+        bool,
+        Field(description="Include carry-on bag fee in displayed price"),
+    ] = False,
+    show_all_results: Annotated[
+        bool,
+        Field(description="Return all available results instead of curated ~30"),
+    ] = True,
 ) -> dict[str, Any]:
     """Search for flights between two airports on a specific date.
 
@@ -529,6 +588,11 @@ def search_flights(
         max_stops=max_stops,
         sort_by=sort_by,
         passengers=passengers or CONFIG.default_passengers,
+        exclude_basic_economy=exclude_basic_economy,
+        emissions=emissions,
+        checked_bags=checked_bags,
+        carry_on=carry_on,
+        show_all_results=show_all_results,
     )
     return _execute_flight_search(params)
 
@@ -744,7 +808,7 @@ def configuration_resource() -> str:
             "prefix": "FLI_MCP_",
             "variables": {
                 "FLI_MCP_DEFAULT_PASSENGERS": "Adjust the default passenger count.",
-                "FLI_MCP_DEFAULT_CURRENCY": "Override the currency code returned with results.",
+                "FLI_MCP_DEFAULT_CURRENCY": "Override the fallback currency code for results.",
                 "FLI_MCP_DEFAULT_CABIN_CLASS": "Set a default cabin class.",
                 "FLI_MCP_DEFAULT_SORT_BY": "Set the default result sorting strategy.",
                 "FLI_MCP_DEFAULT_DEPARTURE_WINDOW": "Provide a default departure window (HH-HH).",
