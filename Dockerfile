@@ -8,7 +8,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock README.md ./
 COPY fli/ ./fli/
 
-RUN uv sync --frozen --no-dev --no-cache
+RUN uv sync --frozen --no-dev --extra mcp --no-cache
 
 
 # Stage 2: minimal runtime
