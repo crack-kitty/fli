@@ -86,7 +86,7 @@ def dates(
         typer.Option(
             "--airlines",
             "-a",
-            help="List of airline IATA codes (e.g., BA KL)",
+            help="Airline IATA codes (e.g., BA,KL or repeated --airlines BA --airlines KL)",
         ),
     ] = None,
     is_round_trip: Annotated[
