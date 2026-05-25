@@ -5,6 +5,7 @@ from typing import Annotated, Any
 import typer
 
 from fli.cli.enums import OutputFormat
+from fli.cli.errors import json_error_payload, report_cli_error
 from fli.cli.utils import (
     build_json_error_response,
     build_json_success_response,
@@ -18,6 +19,7 @@ from fli.cli.utils import (
 from fli.core import (
     build_flight_segments,
     parse_airlines,
+    parse_alliances,
     parse_cabin_class,
     parse_emissions,
     parse_max_stops,
@@ -31,7 +33,7 @@ from fli.models import (
     LayoverRestrictions,
     PassengerInfo,
 )
-from fli.search import SearchFlights
+from fli.search import SearchClientError, SearchFlights
 
 
 def _search_flights_core(
@@ -52,6 +54,13 @@ def _search_flights_core(
     all_results: bool = True,
     output_format: OutputFormat = OutputFormat.TEXT,
     currency: str = "USD",
+    language: str | None = None,
+    country: str | None = None,
+    exclude_airlines: list[str] | None = None,
+    alliance: list[str] | None = None,
+    exclude_alliance: list[str] | None = None,
+    min_layover: int | None = None,
+    max_layover: int | None = None,
 ) -> None:
     """Core flight search functionality."""
     query: dict[str, Any] = {
@@ -60,7 +69,7 @@ def _search_flights_core(
         "departure_date": departure_date,
         "return_date": return_date,
         "departure_window": None,
-        "airlines": [airline.upper() for airline in airlines] if airlines else None,
+        "airlines": None,
         "cabin_class": cabin_class.upper(),
         "max_stops": max_stops.upper(),
         "sort_by": sort_by.upper(),
@@ -82,6 +91,21 @@ def _search_flights_core(
         seat_type = parse_cabin_class(cabin_class)
         stops = parse_max_stops(max_stops)
         parsed_airlines = parse_airlines(airlines)
+        parsed_exclude_airlines = parse_airlines(exclude_airlines)
+        parsed_alliances = parse_alliances(alliance)
+        parsed_exclude_alliances = parse_alliances(exclude_alliance)
+        query["airlines"] = (
+            [airline.name.lstrip("_") for airline in parsed_airlines] if parsed_airlines else None
+        )
+        query["exclude_airlines"] = (
+            [a.name.lstrip("_") for a in parsed_exclude_airlines]
+            if parsed_exclude_airlines
+            else None
+        )
+        query["alliances"] = [a.value for a in parsed_alliances] if parsed_alliances else None
+        query["exclude_alliances"] = (
+            [a.value for a in parsed_exclude_alliances] if parsed_exclude_alliances else None
+        )
         sort = parse_sort_by(sort_by)
         emissions_filter = parse_emissions(emissions)
 
@@ -104,11 +128,15 @@ def _search_flights_core(
             time_restrictions=time_restrictions,
         )
 
-        # Parse layover airports
+        # Parse layover constraints (airports, min duration, max duration).
         layover_restrictions = None
-        if layover:
-            layover_airports = [resolve_airport(code) for code in layover]
-            layover_restrictions = LayoverRestrictions(airports=layover_airports)
+        layover_airports = [resolve_airport(code) for code in layover] if layover else None
+        if layover_airports or min_layover is not None or max_layover is not None:
+            layover_restrictions = LayoverRestrictions(
+                airports=layover_airports,
+                min_duration=min_layover,
+                max_duration=max_layover,
+            )
 
         # Build bags filter
         bags_filter = None
@@ -123,6 +151,9 @@ def _search_flights_core(
             stops=stops,
             seat_type=seat_type,
             airlines=parsed_airlines,
+            airlines_exclude=parsed_exclude_airlines,
+            alliances=parsed_alliances,
+            alliances_exclude=parsed_exclude_alliances,
             sort_by=sort,
             exclude_basic_economy=exclude_basic_economy,
             layover_restrictions=layover_restrictions,
@@ -131,9 +162,15 @@ def _search_flights_core(
             show_all_results=all_results,
         )
 
-        # Perform search
+        # Perform search; `currency` doubles as Google's `curr=` URL param so
+        # results come back priced in the requested currency.
         search_client = SearchFlights()
-        results = search_client.search(filters)
+        results = search_client.search(
+            filters,
+            currency=currency,
+            language=language,
+            country=country,
+        )
 
         if not results:
             if output_format == OutputFormat.JSON:
@@ -166,7 +203,7 @@ def _search_flights_core(
             )
             return
 
-        display_flight_results(results, default_currency=currency)
+        display_flight_results(results, trip_type=trip_type, default_currency=currency)
 
     except ParseError as e:
         if output_format == OutputFormat.JSON:
@@ -195,6 +232,32 @@ def _search_flights_core(
 
         typer.echo(f"Error: {str(e)}")
         raise typer.Exit(1) from e
+    except SearchClientError as e:
+        if output_format == OutputFormat.JSON:
+            message, error_type, log_path = json_error_payload(e, command="flights")
+            payload = build_json_error_response(
+                search_type="flights",
+                message=message,
+                error_type=error_type,
+                query=query,
+            )
+            payload["error"]["log_path"] = str(log_path)
+            emit_json(payload)
+            raise typer.Exit(1) from e
+        raise report_cli_error(e, command="flights") from e
+    except Exception as e:  # noqa: BLE001 — fall back to clean reporting
+        if output_format == OutputFormat.JSON:
+            message, error_type, log_path = json_error_payload(e, command="flights")
+            payload = build_json_error_response(
+                search_type="flights",
+                message=message,
+                error_type=error_type,
+                query=query,
+            )
+            payload["error"]["log_path"] = str(log_path)
+            emit_json(payload)
+            raise typer.Exit(1) from e
+        raise report_cli_error(e, command="flights") from e
 
 
 def flights(
@@ -222,7 +285,7 @@ def flights(
         typer.Option(
             "--airlines",
             "-a",
-            help="List of airline IATA codes (e.g., BA KL)",
+            help="Airline IATA codes (e.g., BA,KL or repeated --airlines BA --airlines KL)",
         ),
     ] = None,
     cabin_class: Annotated[
@@ -310,19 +373,80 @@ def flights(
         typer.Option(
             "--currency",
             callback=validate_currency,
-            help="Fallback currency code when not returned by Google (e.g., CAD, EUR).",
+            help="Currency code (USD, EUR, GBP, JPY...). Passed to Google as `curr=`.",
         ),
     ] = "USD",
+    language: Annotated[
+        str | None,
+        typer.Option(
+            "--language",
+            help="Optional BCP-47 language code (e.g., 'en-GB') passed to Google as `hl=`.",
+        ),
+    ] = None,
+    country: Annotated[
+        str | None,
+        typer.Option(
+            "--country",
+            help="Optional ISO 3166-1 alpha-2 country code (e.g., 'GB') passed to Google as `gl=`.",
+        ),
+    ] = None,
+    exclude_airlines: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-airlines",
+            "-A",
+            help=(
+                "Airline IATA codes to EXCLUDE from results (e.g., BA,KL "
+                "or repeated --exclude-airlines BA --exclude-airlines KL)."
+            ),
+        ),
+    ] = None,
+    alliance: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--alliance",
+            help=(
+                "Restrict results to one or more airline alliances: "
+                "ONEWORLD, SKYTEAM, STAR_ALLIANCE (comma-separated allowed)."
+            ),
+        ),
+    ] = None,
+    exclude_alliance: Annotated[
+        list[str] | None,
+        typer.Option(
+            "--exclude-alliance",
+            help="Alliance names to EXCLUDE (ONEWORLD, SKYTEAM, STAR_ALLIANCE).",
+        ),
+    ] = None,
+    min_layover: Annotated[
+        int | None,
+        typer.Option(
+            "--min-layover",
+            help="Minimum layover duration in minutes (multi-stop trips only).",
+            min=1,
+        ),
+    ] = None,
+    max_layover: Annotated[
+        int | None,
+        typer.Option(
+            "--max-layover",
+            help="Maximum layover duration in minutes (multi-stop trips only).",
+            min=1,
+        ),
+    ] = None,
 ):
     """Search for flights on a specific date.
 
     Example:
-        fli flights JFK LHR 2025-10-25 --time 6-20 --airlines BA KL --stops NON_STOP
-        fli flights JFK LHR 2025-10-25 --format json
-        fli flights JFK LHR 2025-10-25 --exclude-basic
-        fli flights JFK LAX 2025-10-25 --bags 1 --carry-on
-        fli flights JFK LAX 2025-10-25 --emissions LESS
-        fli flights JFK LAX 2025-10-25 --all
+        fli flights JFK LHR 2026-10-25 --time 6-20 --airlines BA,KL --stops NON_STOP
+        fli flights JFK LHR 2026-10-25 --format json
+        fli flights JFK LHR 2026-10-25 --exclude-basic
+        fli flights JFK LAX 2026-10-25 --bags 1 --carry-on
+        fli flights JFK LAX 2026-10-25 --emissions LESS
+        fli flights JFK LAX 2026-10-25 --all
+        fli flights JFK FRA 2026-10-25 --alliance ONEWORLD
+        fli flights JFK LAX 2026-10-25 --exclude-airlines DL
+        fli flights BUF ATH 2026-10-25 --min-layover 120
 
     """
     _search_flights_core(
@@ -343,4 +467,11 @@ def flights(
         all_results=all_results,
         output_format=output_format,
         currency=currency,
+        language=language,
+        country=country,
+        exclude_airlines=exclude_airlines,
+        alliance=alliance,
+        exclude_alliance=exclude_alliance,
+        min_layover=min_layover,
+        max_layover=max_layover,
     )
