@@ -1,6 +1,6 @@
 [project]
 name = "flights"
-version = "0.10.0"
+version = "0.11.1"
 description = "A Python wrapper for Google Flights API"
 authors = [
     { name = "Punit Arani", email = "punitsai36@gmail.com" }
@@ -24,12 +24,15 @@ classifiers = [
 
 dependencies = [
     "babel>=2.17.0",
-    "curl-cffi>=0.7.4",
+    "curl-cffi>=0.15.0",
     "httpx>=0.28.1",
-    "plotext>=5.3.2",
+    # plotext 6 replaced the module-level plotting API that fli/cli/utils.py uses.
+    # Lifting this cap? Also drop the plotext ignore in .github/dependabot.yml.
+    "plotext>=5.3.2,<6",
     "pydantic>=2.10.4",
     "python-dotenv>=1.0.1",
     "ratelimit>=2.2.1",
+    "rich>=13.8.0",
     "tenacity>=9.0.0",
     "typer>=0.15.1",
 ]
@@ -38,7 +41,9 @@ dependencies = [
 mcp = [
     "fastapi>=0.115.6",
     "fastmcp>=3.2",
+    "mcp>=1.2.0",
     "pydantic-settings>=2.0.0",
+    "starlette>=0.27",
     "uvicorn>=0.34.0",
 ]
 all = [
@@ -52,7 +57,7 @@ dev = [
     "pytest-xdist>=3.6.1",
     "pytest-cov>=6.0.0",
     "ruff>=0.8.4",
-    "twine>=6.0.0",
+    "twine>=7.0.0",
 ]
 
 [project.scripts]

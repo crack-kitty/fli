@@ -19,6 +19,11 @@ export {
 } from "./currency.ts";
 export { formatIsoDate, ISO_DATE_RE, parseIsoDate } from "./dates.ts";
 export {
+  type GoogleFlightsUrlOptions,
+  googleFlightsUrl,
+  withLocaleParams,
+} from "./links.ts";
+export {
   ParseError,
   parseAirlines,
   parseAlliances,

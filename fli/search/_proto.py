@@ -1,19 +1,28 @@
-"""Minimal protobuf wire-format encoder used to build the GetBookingResults token.
+"""Minimal protobuf wire-format encoder used to build booking tokens and URLs.
 
-Google's booking-options endpoint accepts a base64-encoded protobuf as
-``outer[0][1]``. The structure was reverse-engineered from a live capture
-on 2026-05-14 (see ``.reverse-eng/notes/booking_results.md``):
+Two token types are implemented:
 
-::
+1. **GetBookingResults token** (``outer[0][1]``) — used for the vendor-list
+   API call.  Structure reverse-engineered 2026-05-14 (see
+   ``.reverse-eng/notes/booking_results.md``):
 
-    field 1 (length-delim): shopping session id            (response `inner[0][4]`)
-    field 2 (length-delim): "{airline}{flight_no}#{idx}"   (selected itinerary)
-    field 3 (length-delim, nested):
-        field 1 (varint): price in smallest currency unit   (e.g. cents)
-        field 2 (varint): 2                                 (constant in our samples)
-        field 3 (length-delim): ISO currency code           (e.g. "USD")
-    field 7 (varint): 28                                    (stops bucket marker)
-    field 14 (varint): same as inner field 1                (price duplicated)
+   ::
+
+       field 1 (length-delim): shopping session id            (response ``inner[0][4]``)
+       field 2 (length-delim): "{airline}{flight_no}#{idx}"   (selected itinerary)
+       field 3 (length-delim, nested):
+           field 1 (varint): price in smallest currency unit   (e.g. cents)
+           field 2 (varint): 2                                 (constant)
+           field 3 (length-delim): ISO currency code           (e.g. "USD")
+       field 7 (varint): 28                                    (stops bucket marker)
+       field 14 (varint): same as inner field 1                (price duplicated)
+
+2. **Deep-link itinerary token** (``tfs``) — embedded in
+   ``https://www.google.com/travel/flights/booking?tfs=…`` to open a specific
+   itinerary's booking page (vendor fares + "Continue" CTA included). The
+   ``tfs`` token alone is sufficient; the companion ``tfu`` token Google's UI
+   also emits is not needed and is intentionally not built. Structure
+   reverse-engineered 2026-05-28 (see ``.reverse-eng/notes/booking_results.md``).
 
 We implement only the protobuf primitives we need here — varint, length-
 delimited string/bytes, nested-message — to avoid the protobuf-runtime
@@ -24,8 +33,36 @@ from __future__ import annotations
 
 import base64
 import logging
+from collections.abc import Sequence
+from dataclasses import dataclass
+from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# tfs deep-link helpers
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class LegSpec:
+    """One physical leg within a booking-URL segment.
+
+    Attributes:
+        origin: IATA code of the departure airport (e.g. ``"SFO"``).
+        dep_date: Departure date in ``YYYY-MM-DD`` format.
+        dest: IATA code of the arrival airport (e.g. ``"PHX"``).
+        airline: Airline IATA code (e.g. ``"AA"``).
+        flight_number: Flight number string (e.g. ``"2413"``).
+
+    """  # noqa: D413 — blank-line-after-last-section false-positive on frozen dataclass
+
+    origin: str
+    dep_date: str
+    dest: str
+    airline: str
+    flight_number: str
 
 
 def _varint(value: int) -> bytes:
@@ -193,95 +230,272 @@ def _read_varint(buf: bytes, off: int) -> tuple[int, int]:
         shift += 7
 
 
-def extract_booking_token_from_tfu(tfu: str) -> str:
-    """Extract the booking token from a booking-page ``tfu`` URL parameter.
+# ---------------------------------------------------------------------------
+# Deep-link URL parameter builder (tfs)
+# ---------------------------------------------------------------------------
 
-    Google Flights' booking page URL has the shape::
 
-        /booking?tfs=<tfs>&tfu=<tfu>...
+def _to_urlsafe_b64(data: bytes) -> str:
+    """Encode *data* as URL-safe base64 without ``=`` padding.
 
-    where ``tfu`` is a base64-encoded protobuf wrapping the booking token::
+    The ``tfs`` query parameter uses the urlsafe alphabet (``-`` / ``_``) with
+    padding stripped.
+    """
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
-        tfu = base64( protobuf {
-          field 1 (str): base64( <booking token bytes> )
-          field 2 (nested): { ... }
-          field 4 (str): "" or other padding
-        } )
 
-    This helper accepts either a bare ``tfu`` value or a full URL and
-    returns the inner booking token in the same base64 form
-    :class:`SearchFlights.get_booking_options` accepts via its
-    ``booking_token`` kwarg.
+# ``tfs`` is the itinerary parameter shared by booking deep links and the
+# public search page. Both builders below write the same message, so the
+# field layout lives here once:
+#
+#   1  = 28 (constant)          8  = passenger kind, repeated
+#   2  = 2 (constant)           9  = cabin class
+#   3  = segment, repeated      14 = 1 (constant)
+#   3.2  = departure date       16 = max-uint64 pin (deep links only)
+#   3.4  = selected leg, rep.   19 = 2 one-way / multi-city, 1 round-trip
+#   3.5  = stop ceiling
+#   3.6  = carrier include, repeated (IATA code or alliance name)
+#   3.7  = carrier exclude, repeated (same values as 3.6)
+#   3.13 = origin  3.14 = destination
+#   3.15 = layover airport include, repeated
+#   3.17 = min layover minutes  3.18 = max layover minutes
+#
+# Reverse-engineered from live browser captures; see
+# ``.reverse-eng/notes/booking_results.md``.
+
+_MAX_U64 = (1 << 64) - 1
+
+# Passenger kinds, in the order Google's repeated field 8 numbers them:
+# 1 = adult, 2 = child, 3 = infant on lap, 4 = infant in own seat.
+#
+# The two infant codes are easy to transpose and the mistake is expensive
+# rather than loud: on an international route a lap infant prices at ~10% of
+# the adult fare and an infant in its own seat at ~100%, so a swap quotes a
+# plausible but wrong fare instead of erroring. Pricing one fixed itinerary
+# (BA178 JFK->LHR, economy) confirms the mapping — $295 for ``[1]``, $324 for
+# ``[1, 3]`` (+10%, lap), $589 for ``[1, 4]`` (+100%, own seat, same as the
+# ``[1, 2]`` child fare). The legacy RPC struct orders the same four counts
+# ``[adults, children, infants_on_lap, infants_in_seat]``; see
+# ``FlightSearchFilters.format`` in :mod:`fli.models.google_flights.flights`.
+_PASSENGER_FIELDS = ("adults", "children", "infants_on_lap", "infants_in_seat")
+
+# Google's own per-booking limit — the same ceiling ``PassengerInfo`` enforces
+# in ``validate_passenger_counts`` (``fli.models.google_flights.base``).
+# ``PassengerInfo`` has no public constant for it (just the literal in that
+# validator), so this is a second copy of the same number rather than an
+# import; keep the two in sync if Google's limit ever changes.
+_MAX_TOTAL_PASSENGERS = 9
+
+
+def passenger_codes(passenger_info: Any) -> list[int]:
+    """Convert a ``PassengerInfo`` into ``tfs`` field-8 codes, one per traveller.
+
+    Shared by :func:`fli.search._tfs.build_tfs` (the search token) and
+    :func:`build_tfs_token` (the per-flight booking token) so the two cannot
+    drift on how they encode the passenger mix — see ``_PASSENGER_FIELDS``
+    above for why getting the codes right (especially the two infant kinds)
+    matters.
 
     Args:
-        tfu: A ``tfu`` URL parameter value, or a full URL containing one.
+        passenger_info: A ``PassengerInfo``, or any duck-typed object
+            exposing some subset of ``adults``/``children``/
+            ``infants_on_lap``/``infants_in_seat`` as attributes (missing
+            ones count as zero). ``None`` is treated as an all-zero mix.
 
     Returns:
-        The base64-encoded booking token suitable for
-        :meth:`SearchFlights.get_booking_options`.
+        One code per traveller, in field order. Falls back to ``[1]`` (a
+        single adult) when the mix would otherwise be empty — Google's
+        booking page requires at least one traveller, and that is also the
+        implicit default callers got before this helper existed.
 
     Raises:
-        ValueError: If the input does not contain a parseable tfu blob.
+        ValueError: Any count is not a non-negative ``int`` (``bool``
+            included — it is an ``int`` subclass but not a traveller count),
+            or the total exceeds :data:`_MAX_TOTAL_PASSENGERS`. Checked
+            before building the result list, so a wildly out-of-range count
+            (a duck-typed ``adults=10**6``, say) fails immediately instead of
+            allocating a list that size — callers that pass a validated
+            ``PassengerInfo`` never hit this; it exists for the duck-typed
+            callers this function otherwise tolerates.
 
     """
-    # Accept full URL
-    if "tfu=" in tfu:
-        from urllib.parse import parse_qs, urlparse
+    total = 0
+    counts: list[tuple[int, int]] = []  # (code, count), one pair per field
+    for kind, code in zip(_PASSENGER_FIELDS, (1, 2, 3, 4), strict=False):
+        count = getattr(passenger_info, kind, 0)
+        # `bool` is a subclass of `int` in Python, so `isinstance(True, int)`
+        # is true — excluded explicitly, since `True` is not a traveller count.
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0:
+            raise ValueError(f"passenger_info.{kind} must be a non-negative int, got {count!r}")
+        total += count
+        counts.append((code, count))
 
-        parts = urlparse(tfu)
-        qs = parse_qs(parts.query)
-        if "tfu" not in qs:
-            raise ValueError("URL has no `tfu` query parameter")
-        tfu = qs["tfu"][0]
+    if total > _MAX_TOTAL_PASSENGERS:
+        raise ValueError(
+            f"passenger_info totals {total} travellers, over the "
+            f"{_MAX_TOTAL_PASSENGERS}-traveller limit Google's booking page enforces"
+        )
 
-    # Decode the outer protobuf
-    padding = "=" * ((4 - len(tfu) % 4) % 4)
-    try:
-        raw = base64.urlsafe_b64decode(tfu + padding)
-    except (ValueError, base64.binascii.Error) as e:
-        raise ValueError(f"tfu is not valid base64: {e}") from e
-
-    # Walk protobuf fields looking for field 1 (length-delim string)
-    off = 0
-    while off < len(raw):
-        tag, off = _read_varint(raw, off)
-        field = tag >> 3
-        wire = tag & 0x7
-        if wire == 0:
-            _, off = _read_varint(raw, off)
-        elif wire == 2:
-            length, off = _read_varint(raw, off)
-            data = raw[off : off + length]
-            off += length
-            if field == 1:
-                try:
-                    token_b64 = data.decode("ascii")
-                except UnicodeDecodeError as e:
-                    raise ValueError("tfu field 1 is not ASCII") from e
-                # Strip trailing whitespace/padding-like chars and
-                # re-normalise to the standard base64 alphabet so the
-                # downstream parser accepts it.
-                token_b64 = token_b64.strip().rstrip("=")
-                return token_b64
-        elif wire == 5:
-            off += 4
-        elif wire == 1:
-            off += 8
-        else:
-            raise ValueError(f"unsupported wire type {wire} at offset {off}")
-
-    raise ValueError("tfu protobuf has no field 1 (booking token)")
+    codes = [code for code, count in counts for _ in range(count)]
+    return codes or [1]
 
 
-def extract_session_id_from_tfu(tfu: str) -> str:
-    """Extract the booking session id from a ``tfu`` URL parameter.
+def encode_tfs_segment(
+    origin: str,
+    dest: str,
+    date: str,
+    legs: Sequence[LegSpec] = (),
+    max_stops: int | None = None,
+    carriers: Sequence[str] = (),
+    carriers_exclude: Sequence[str] = (),
+    layover_airports: Sequence[str] = (),
+    min_layover: int | None = None,
+    max_layover: int | None = None,
+) -> bytes:
+    """Encode one travel direction of a ``tfs`` itinerary.
 
-    Convenience wrapper that calls :func:`extract_booking_token_from_tfu`
-    then decodes the inner token's ``field 1`` (the session id).
+    Args:
+        origin: IATA code the direction departs from.
+        dest: IATA code the direction arrives at.
+        date: Departure date in ``YYYY-MM-DD`` format.
+        legs: Physical flights pinned for this direction, if any. Supplying
+            them narrows a search to itineraries that include them — that is
+            how a round-trip search asks for return options against a chosen
+            outbound.
+        max_stops: Stop ceiling, zero-based (``0`` = non-stop, ``1`` = one
+            stop or fewer). ``None`` leaves the search unconstrained;
+            passing ``0`` for "any" would pin it to non-stop instead.
+        carriers: Only itineraries on these carriers. Google takes airline
+            IATA codes and alliance names (``"STAR_ALLIANCE"``) in the same
+            list.
+        carriers_exclude: The same values, as an exclude list.
+        layover_airports: Only these airports may be used as layover stops.
+        min_layover: Minimum layover wait, in minutes.
+        max_layover: Maximum layover wait, in minutes.
+
+    Returns:
+        The length-delimited field 3 bytes for this segment.
+
     """
-    inner_token = extract_booking_token_from_tfu(tfu)
-    decoded = decode_booking_token(inner_token)
-    session = decoded.get("field_1")
-    if not isinstance(session, str):
-        raise ValueError("inner booking token has no field 1 (session id)")
-    return session
+    body = _length_delim(2, date.encode())
+    if max_stops is not None:
+        body += _varint_field(5, max_stops)
+    for code in carriers:
+        body += _length_delim(6, code.encode())
+    for code in carriers_exclude:
+        body += _length_delim(7, code.encode())
+    for leg in legs:
+        body += _length_delim(
+            4,
+            _length_delim(1, leg.origin.encode())
+            + _length_delim(2, leg.dep_date.encode())
+            + _length_delim(3, leg.dest.encode())
+            + _length_delim(5, leg.airline.encode())
+            + _length_delim(6, leg.flight_number.encode()),
+        )
+    for code in [origin] if isinstance(origin, str) else origin:
+        body += _length_delim(13, _varint_field(1, 1) + _length_delim(2, code.encode()))
+    for code in [dest] if isinstance(dest, str) else dest:
+        body += _length_delim(14, _varint_field(1, 1) + _length_delim(2, code.encode()))
+    for code in layover_airports:
+        body += _length_delim(15, code.encode())
+    if min_layover is not None:
+        body += _varint_field(17, min_layover)
+    if max_layover is not None:
+        body += _varint_field(18, max_layover)
+    return _length_delim(3, body)
+
+
+def encode_tfs_payload(
+    segments: bytes,
+    *,
+    is_one_way: bool,
+    passengers: Sequence[int] = (1,),
+    seat: int = 1,
+    pin_max_u64: bool = False,
+) -> str:
+    """Wrap encoded segments in the ``tfs`` envelope and base64 it.
+
+    Args:
+        segments: Concatenated output of :func:`encode_tfs_segment`.
+        is_one_way: ``True`` for one-way, ``False`` for round-trip.
+            Controls field 19. Multi-city is a third value (3) that the
+            search page cannot serve — see :func:`fli.search._tfs.build_tfs`.
+        passengers: Passenger kind codes, one entry per traveller
+            (1 = adult, 2 = child, 3 = infant on lap, 4 = infant in own
+            seat). The two infant codes are the ones to get right: a lap
+            infant prices at ~10% of the adult fare and an infant in its own
+            seat at ~100%, and transposing them produces a plausible wrong
+            quote rather than an error. See ``_PASSENGER_FIELDS`` above (and
+            :func:`passenger_codes`) for the live fare evidence.
+        seat: Cabin class (1 = economy, 2 = premium, 3 = business, 4 = first).
+        pin_max_u64: Emit the field 16 constant that booking deep links
+            carry. The search page does not need it.
+
+    Returns:
+        URL-safe base64 string with padding stripped.
+
+    """
+    payload = _varint_field(1, 28) + _varint_field(2, 2) + segments
+    for kind in passengers:
+        payload += _varint_field(8, kind)
+    payload += _varint_field(9, seat) + _varint_field(14, 1)
+    if pin_max_u64:
+        payload += _length_delim(16, _varint_field(1, _MAX_U64))
+    payload += _varint_field(19, 2 if is_one_way else 1)
+    return _to_urlsafe_b64(payload)
+
+
+def build_tfs_token(
+    segments: list[list[LegSpec]],
+    *,
+    is_one_way: bool = True,
+    passengers: Sequence[int] = (1,),
+    seat: int = 1,
+) -> str:
+    """Build the ``tfs`` query parameter for a Google Flights deep-link URL.
+
+    The ``tfs`` token encodes the complete itinerary — one segment per travel
+    direction, each segment containing one leg per physical flight.  It is
+    deterministic (no session id required) and can be constructed purely from
+    search-result data.
+
+    Reverse-engineered 2026-05-28 from live browser captures of one-way
+    nonstop, one-way connection (2-stop), and round-trip booking pages (see
+    ``.reverse-eng/notes/booking_results.md``).
+
+    Args:
+        segments: Ordered list of travel directions.  Each element is a list
+            of :class:`LegSpec` describing every physical leg in that
+            direction (one leg for nonstop, two or more for connections).
+        is_one_way: ``True`` for one-way; ``False`` for round-trip.
+            Controls the ``f19`` constant.
+        passengers: Passenger kind codes, one entry per traveller (field 8).
+            Build these from a search's ``PassengerInfo`` with
+            :func:`passenger_codes`. Defaults to a single adult so existing
+            callers keep producing the captured tokens.
+        seat: Cabin class encoded in field 9.  ``1`` = economy, ``2`` =
+            premium economy, ``3`` = business, ``4`` = first.  Defaults to
+            economy so existing callers keep producing the captured tokens.
+
+    Returns:
+        URL-safe base64 string (no ``=`` padding) suitable for use as the
+        ``tfs=`` query parameter.
+
+    Raises:
+        ValueError: *segments* is empty or any segment has no legs.
+
+    """
+    if not segments:
+        raise ValueError("segments must be non-empty")
+    for i, seg in enumerate(segments):
+        if not seg:
+            raise ValueError(f"segment {i} has no legs")
+
+    encoded = b"".join(
+        encode_tfs_segment(seg[0].origin, seg[-1].dest, seg[0].dep_date, legs=seg)
+        for seg in segments
+    )
+    return encode_tfs_payload(
+        encoded, is_one_way=is_one_way, passengers=passengers, seat=seat, pin_max_u64=True
+    )

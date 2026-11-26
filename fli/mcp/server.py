@@ -12,13 +12,18 @@ from typing import Annotated, Any
 
 from fastmcp import FastMCP
 from mcp.types import Icon
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 from fli.core import (
     build_date_search_segments,
     build_flight_segments,
     build_time_restrictions,
+    classify_error,
+    format_validation_error,
+    google_flights_url,
     parse_airlines,
     parse_alliances,
     parse_cabin_class,
@@ -27,18 +32,29 @@ from fli.core import (
     parse_max_stops,
     parse_sort_by,
     resolve_airport,
+    resolve_airports,
     search_airports,
 )
 from fli.core.parsers import ParseError
 from fli.models import (
+    Airline,
     Airport,
     BagsFilter,
     DateSearchFilters,
+    ExplorePlace,
+    ExploreRegion,
+    ExploreSearchFilters,
     FlightSearchFilters,
     PassengerInfo,
+    PriceLimit,
     TripType,
+    display_name,
 )
-from fli.search import SearchDates, SearchFlights
+from fli.models.google_flights.explore import KG_MID_PREFIXES
+from fli.search import SearchDates, SearchExplore, SearchFlights
+from fli.search.dates import MAX_DATES_PER_SEARCH
+from fli.search.exceptions import SearchParseError
+from fli.search.flights import SPARSE_PASSENGER_MIX_WARNING
 
 
 class FlightSearchConfig(BaseSettings):
@@ -91,9 +107,25 @@ mcp = FastMCP(
 )
 
 
+@mcp.custom_route("/health", methods=["GET"])
+async def health_check(_request: Request) -> JSONResponse:
+    """Liveness probe for container healthchecks (see ``docker-compose.yml``).
+
+    Deliberately does not call Google Flights: an upstream outage should not
+    make the orchestrator restart an otherwise healthy server.
+    """
+    return JSONResponse({"status": "ok"})
+
+
 # =============================================================================
 # Request/Response Models
 # =============================================================================
+
+# Filters the API surface still accepts but the current transport cannot
+# honour (see "Search transport" in README.md). Spelled out in every
+# parameter description because an LLM caller reads the tool schema, not the
+# README.
+_IGNORED_BY_TRANSPORT = "Currently ignored by the search-page transport (logged as a warning)."
 
 
 class FlightSearchParams(BaseModel):
@@ -131,14 +163,29 @@ class FlightSearchParams(BaseModel):
         ge=1,
         description="Number of adult passengers",
     )
+    children: int = Field(0, ge=0, description="Number of children (ages 2-11)")
+    infants_in_seat: int = Field(
+        0, ge=0, description="Number of infants (under 2) occupying their own seat"
+    )
+    infants_on_lap: int = Field(0, ge=0, description="Number of lap infants (under 2, no seat)")
     exclude_basic_economy: bool = Field(
-        False, description="Exclude basic economy fares from results"
+        False,
+        description=f"Exclude basic economy fares from results. {_IGNORED_BY_TRANSPORT}",
     )
-    emissions: str = Field("ALL", description="Filter by emissions level: ALL or LESS")
+    emissions: str = Field(
+        "ALL",
+        description=f"Filter by emissions level: ALL or LESS. {_IGNORED_BY_TRANSPORT}",
+    )
     checked_bags: int = Field(
-        0, ge=0, le=2, description="Number of checked bags to include in price (0, 1, or 2)"
+        0,
+        ge=0,
+        le=2,
+        description=f"Number of checked bags in price (0-2). {_IGNORED_BY_TRANSPORT}",
     )
-    carry_on: bool = Field(False, description="Include carry-on bag fee in displayed price")
+    carry_on: bool = Field(
+        False,
+        description=f"Include carry-on bag fee in displayed price. {_IGNORED_BY_TRANSPORT}",
+    )
     show_all_results: bool = Field(
         True, description="Return all available results instead of curated ~30"
     )
@@ -181,6 +228,17 @@ class FlightSearchParams(BaseModel):
         ge=1,
         description="Maximum layover duration in minutes (multi-stop trips only).",
     )
+    top_n: int = Field(
+        5,
+        description=(
+            "Round-trip only: number of outbound options to expand into return-flight "
+            "combinations. Cost is `1 + top_n` page fetches (one outbound search plus one "
+            "per expanded candidate). The default sort expands only the cheapest `top_n` "
+            "outbounds, which are often all the same airline — raise top_n (max 10) to see "
+            "more carriers on a round trip, at the cost of more requests. Ignored for "
+            "one-way searches."
+        ),
+    )
 
 
 class DateSearchParams(BaseModel):
@@ -193,7 +251,12 @@ class DateSearchParams(BaseModel):
         description="Arrival airport IATA code(s), comma-separated for multiple (e.g., 'LHR,CDG')"
     )
     start_date: str = Field(description="Start of date range in YYYY-MM-DD format")
-    end_date: str = Field(description="End of date range in YYYY-MM-DD format")
+    end_date: str = Field(
+        description=(
+            "End of date range in YYYY-MM-DD format. A range may span at most "
+            f"{MAX_DATES_PER_SEARCH} dates; each date costs its own page fetch."
+        )
+    )
     trip_duration: int = Field(
         3, ge=1, description="Trip duration in days (for round-trip searches)"
     )
@@ -217,6 +280,11 @@ class DateSearchParams(BaseModel):
         ge=1,
         description="Number of adult passengers",
     )
+    children: int = Field(0, ge=0, description="Number of children (ages 2-11)")
+    infants_in_seat: int = Field(
+        0, ge=0, description="Number of infants (under 2) occupying their own seat"
+    )
+    infants_on_lap: int = Field(0, ge=0, description="Number of lap infants (under 2, no seat)")
     currency: str | None = Field(
         None,
         description=(
@@ -258,6 +326,85 @@ class DateSearchParams(BaseModel):
     )
 
 
+class ExploreSearchParams(BaseModel):
+    """Parameters for exploring destinations from an origin (flexible destination)."""
+
+    origin: str = Field(
+        description=(
+            "Departure airport IATA code (e.g., 'JFK'), or a Google knowledge-graph "
+            "mid for a city (e.g., '/m/04jpl' for London)."
+        )
+    )
+    destination: str = Field(
+        "ANYWHERE",
+        description=(
+            "Where to explore: ANYWHERE, EUROPE, SOUTHERN_EUROPE, ASIA, AFRICA, "
+            "NORTH_AMERICA, SOUTH_AMERICA, OCEANIA, or a knowledge-graph mid for a "
+            "region or country (e.g., '/m/07ssc' for the UK). Airports and cities "
+            "are not supported; use search_flights for a specific destination."
+        ),
+    )
+    departure_date: str = Field(description="Departure date in YYYY-MM-DD format (required)")
+    round_trip: bool = Field(
+        False,
+        description=(
+            "Price round trips instead of one-ways. Requires a fixed trip length: set "
+            "trip_min_nights (and trip_max_nights, if given) to the same value."
+        ),
+    )
+    trip_min_nights: int | None = Field(
+        None, ge=0, le=23, description="Trip length in nights (round trips must pin one value)"
+    )
+    trip_max_nights: int | None = Field(
+        None, ge=0, le=23, description="Must equal trip_min_nights for round trips"
+    )
+    max_price: int | None = Field(None, gt=0, description="Maximum price cap for fares")
+    cabin_class: str = Field(
+        CONFIG.default_cabin_class,
+        description="Cabin class: ECONOMY, PREMIUM_ECONOMY, BUSINESS, or FIRST",
+    )
+    max_stops: str = Field(
+        "ANY", description="Maximum stops: ANY, NON_STOP, ONE_STOP, or TWO_PLUS_STOPS"
+    )
+    airlines: list[str] | None = Field(
+        None, description="Filter by airline IATA codes (e.g., ['BA', 'AA'])"
+    )
+    exclude_airlines: list[str] | None = Field(
+        None, description="Airline IATA codes to EXCLUDE from results."
+    )
+    alliance: list[str] | None = Field(
+        None, description="Restrict to alliances: 'ONEWORLD', 'SKYTEAM', 'STAR_ALLIANCE'."
+    )
+    exclude_alliance: list[str] | None = Field(
+        None, description="Alliance names to EXCLUDE from results."
+    )
+    max_flight_duration: int | None = Field(
+        None, gt=0, description="Maximum flight duration in minutes"
+    )
+    passengers: int = Field(
+        CONFIG.default_passengers, ge=1, description="Number of adult passengers"
+    )
+    currency: str | None = Field(
+        None,
+        description=(
+            "ISO 4217 currency code (e.g. 'USD', 'EUR', 'GBP') to bill prices in. "
+            "When omitted, Google picks based on locale (usually USD)."
+        ),
+    )
+    language: str | None = Field(
+        None,
+        description="Optional BCP-47 language code (e.g. 'en-GB') passed to Google as `hl`.",
+    )
+    country: str | None = Field(
+        None,
+        description=(
+            "Optional ISO 3166-1 alpha-2 country code (e.g. 'GB') for Google's `gl` param."
+        ),
+    )
+    sort_by_price: bool = Field(True, description="Sort destinations by price (lowest first)")
+    limit: int | None = Field(None, gt=0, description="Maximum number of destinations to return")
+
+
 # =============================================================================
 # Result Serialization
 # =============================================================================
@@ -267,15 +414,120 @@ def _airline_code(airline: Any) -> str:
     return getattr(airline, "name", str(airline)).lstrip("_")
 
 
+def _iata(airport: Any) -> str:
+    """Return the bare IATA code from an ``Airport`` enum or plain string."""
+    return getattr(airport, "name", str(airport)).lstrip("_")
+
+
+def _google_flights_url(
+    origins: list[Airport],
+    destinations: list[Airport],
+    departure_date: str,
+    return_date: str | None,
+    currency: str | None,
+    language: str | None,
+    country: str | None,
+) -> str:
+    """Build a shareable Google Flights deep link for the search.
+
+    Thin wrapper over :func:`fli.core.google_flights_url` that takes the
+    resolved airport lists used internally; the first airport of each side is
+    used when multiple are given, keeping the query unambiguous for Google's
+    parser.
+    """
+    return google_flights_url(
+        _iata(origins[0]),
+        _iata(destinations[0]),
+        departure_date,
+        return_date,
+        currency=currency,
+        language=language,
+        country=country,
+    )
+
+
+def _serialize_booking_option(option: Any) -> dict[str, Any]:
+    """Serialize a single bookable fare to a clean dictionary."""
+    out: dict[str, Any] = {}
+    for key in (
+        "vendor_name",
+        "vendor_code",
+        "fare_name",
+        "currency",
+        "booking_url",
+        "google_click_url",
+    ):
+        value = getattr(option, key, None)
+        if value not in (None, ""):
+            out[key] = value
+    if getattr(option, "price", None) is not None:
+        out["price"] = option.price
+    if getattr(option, "is_airline_direct", False):
+        out["is_airline_direct"] = True
+    return out
+
+
+def _flight_legs(flight: Any) -> list[Any]:
+    """Flatten a result (or round-trip/multi-city tuple) into its legs."""
+    if isinstance(flight, tuple):
+        return [leg for segment in flight for leg in segment.legs]
+    return list(flight.legs)
+
+
+def _leg_identifiers(leg: Any) -> set[str]:
+    """Return the accepted identifier spellings for a leg ('178' and 'BA178')."""
+    number = str(leg.flight_number).upper().replace(" ", "")
+    code = _airline_code(leg.airline).upper()
+    # Strip a leading airline-code prefix if the flight_number already carries
+    # it (e.g. "BA178" -> "178") so the bare and prefixed forms are always both
+    # valid and we never produce a double-prefixed token ("BABA178").
+    bare = number[len(code) :] if code and number.startswith(code) else number
+    return {bare, f"{code}{bare}"}
+
+
+def _match_flight(flights: list[Any], flight_numbers: list[str] | None) -> Any | None:
+    """Pick the result matching ``flight_numbers`` (order-sensitive).
+
+    Each entry is matched against either the bare flight number ('178') or
+    the airline-prefixed form ('BA178'), case-insensitively. When no flight
+    numbers are supplied the first result is returned (the top/cheapest row
+    under the default sort).
+    """
+    if not flight_numbers:
+        return flights[0] if flights else None
+    want = [fn.upper().replace(" ", "") for fn in flight_numbers]
+    for flight in flights:
+        legs = _flight_legs(flight)
+        if len(legs) != len(want):
+            continue
+        if all(token in _leg_identifiers(leg) for token, leg in zip(want, legs, strict=True)):
+            return flight
+    return None
+
+
+def _flight_idents(flight: Any) -> list[str]:
+    """Human-readable airline+number labels for each leg of a result."""
+    return [f"{_airline_code(leg.airline)}{leg.flight_number}" for leg in _flight_legs(flight)]
+
+
+def _plain_name(value: Any) -> Any:
+    """Return an airport/airline's display name without the internal `` (CODE)`` suffix.
+
+    Legs are duck-typed here (tests and callers may pass plain strings), so
+    anything that is not an ``Airport``/``Airline`` member passes through as is.
+    """
+    return display_name(value) if isinstance(value, Airport | Airline) else value
+
+
 def _serialize_flight_leg(leg: Any) -> dict[str, Any]:
     """Serialize a single flight leg to a dictionary."""
     out: dict[str, Any] = {
-        "departure_airport": leg.departure_airport,
-        "arrival_airport": leg.arrival_airport,
+        "departure_airport": _plain_name(leg.departure_airport),
+        "arrival_airport": _plain_name(leg.arrival_airport),
         "departure_time": leg.departure_datetime,
         "arrival_time": leg.arrival_datetime,
         "duration": leg.duration,
-        "airline": leg.airline,
+        "airline": _plain_name(leg.airline),
         "airline_code": _airline_code(leg.airline),
         "flight_number": leg.flight_number,
     }
@@ -289,6 +541,12 @@ def _serialize_flight_leg(leg: Any) -> dict[str, Any]:
         out["aircraft"] = leg.aircraft
     if getattr(leg, "legroom", None):
         out["legroom"] = leg.legroom
+    cabin_name = getattr(getattr(leg, "cabin", None), "name", None)
+    if isinstance(cabin_name, str):
+        # Report the SeatType member name (ECONOMY / BUSINESS / ...) so it
+        # matches the `cabin_class` tool parameter rather than Google's
+        # numeric code.
+        out["cabin"] = cabin_name
     if getattr(leg, "overnight", False):
         out["overnight"] = True
     amenities = getattr(leg, "amenities", None)
@@ -314,16 +572,17 @@ def _serialize_layover(layover: Any) -> dict[str, Any]:
 def _flight_extras(flight: Any) -> dict[str, Any]:
     """Surface optional rich fields when populated by the parser.
 
-    Emissions fields (``co2_emissions_g`` etc.) are deliberately omitted —
-    the ``--emissions LESS`` filter still flows through to Google, but
-    raw CO₂ numbers are not part of the tool's response shape.
+    Emissions fields (``co2_emissions_g`` etc.) are deliberately omitted:
+    raw CO₂ numbers are not part of the tool's response shape. Note the
+    ``emissions`` filter itself is currently ignored by the search-page
+    transport too — it has no ``tfs`` field — and the search logs a warning
+    naming it. See "Search transport" in README.md.
     """
     out: dict[str, Any] = {}
     for src, key in (
         ("primary_airline_name", "primary_airline_name"),
         ("self_transfer", "self_transfer"),
         ("mixed_cabin", "mixed_cabin"),
-        ("booking_token", "booking_token"),
     ):
         v = getattr(flight, src, None)
         if v is not None and v != "":
@@ -337,7 +596,12 @@ def _flight_extras(flight: Any) -> dict[str, Any]:
     return out
 
 
-def _serialize_flight_result(flight: Any, is_round_trip: bool = False) -> dict[str, Any]:
+def _serialize_flight_result(
+    flight: Any,
+    is_round_trip: bool = False,
+    *,
+    booking_url: str | None = None,
+) -> dict[str, Any]:
     """Serialize a flight result (or round-trip/multi-city tuple) to a dictionary."""
     if not isinstance(flight, tuple):
         out = {
@@ -346,6 +610,8 @@ def _serialize_flight_result(flight: Any, is_round_trip: bool = False) -> dict[s
             "legs": [_serialize_flight_leg(leg) for leg in flight.legs],
         }
         out.update(_flight_extras(flight))
+        if booking_url:
+            out["booking_url"] = booking_url
         return out
 
     segments = list(flight)
@@ -365,6 +631,8 @@ def _serialize_flight_result(flight: Any, is_round_trip: bool = False) -> dict[s
         return_extras = _flight_extras(return_flight)
         if return_extras:
             out["return_flight"] = return_extras
+        if booking_url:
+            out["booking_url"] = booking_url
         return out
 
     # Multi-city (3+ legs) or 2-leg non-round-trip: combined price on the
@@ -376,17 +644,41 @@ def _serialize_flight_result(flight: Any, is_round_trip: bool = False) -> dict[s
         "legs": [_serialize_flight_leg(leg) for segment in segments for leg in segment.legs],
     }
     out.update(_flight_extras(price_segment))
+    if booking_url:
+        out["booking_url"] = booking_url
     return out
 
 
-def _serialize_date_result(date_result: Any) -> dict[str, Any]:
-    """Serialize a date price result to a dictionary."""
-    return {
-        "date": date_result.date,
+def _date_str(value: Any) -> str | None:
+    """Coerce a ``DatePrice`` date element (datetime) to ``YYYY-MM-DD``."""
+    if value is None:
+        return None
+    if hasattr(value, "date"):
+        return value.date().isoformat()
+    return str(value)
+
+
+def _serialize_date_result(
+    date_result: Any,
+    origins: list[Airport],
+    destinations: list[Airport],
+    locale: tuple[str | None, str | None, str | None],
+) -> dict[str, Any]:
+    """Serialize a date price result, including a deep link for that date."""
+    dates = date_result.date
+    departure = _date_str(dates[0]) if dates else None
+    return_date = _date_str(dates[1]) if dates and len(dates) > 1 else None
+    out: dict[str, Any] = {
+        "date": departure,
         "price": date_result.price,
         "currency": date_result.currency or CONFIG.default_currency,
-        "return_date": getattr(date_result, "return_date", None),
+        "return_date": return_date,
     }
+    if departure:
+        out["booking_url"] = _google_flights_url(
+            origins, destinations, departure, return_date, *locale
+        )
+    return out
 
 
 # =============================================================================
@@ -394,91 +686,166 @@ def _serialize_date_result(date_result: Any) -> dict[str, Any]:
 # =============================================================================
 
 
-def _resolve_airports(codes: str) -> list[Airport]:
-    """Resolve one or more comma-separated airport codes."""
-    airports = [resolve_airport(code.strip()) for code in codes.split(",") if code.strip()]
-    if not airports:
-        raise ParseError(f"No valid airport codes found in: '{codes}'")
-    return airports
+# Shared with the CLI; the private name is kept for backwards compatibility.
+_resolve_airports = resolve_airports
+
+
+def _build_flight_filters(
+    params: FlightSearchParams,
+) -> tuple[FlightSearchFilters, TripType, list[Airport], list[Airport]]:
+    """Translate request params into search filters and resolved airports.
+
+    Shared by :func:`_execute_flight_search` and
+    :func:`_execute_booking_options` so both build identical filters from
+    the same inputs.
+    """
+    # Parse inputs using shared utilities (supports comma-separated multi-airport)
+    origins = _resolve_airports(params.origin)
+    destinations = _resolve_airports(params.destination)
+    cabin_class = parse_cabin_class(params.cabin_class)
+    max_stops = parse_max_stops(params.max_stops)
+    sort_by = parse_sort_by(params.sort_by)
+    airlines = parse_airlines(params.airlines)
+    airlines_exclude = parse_airlines(params.exclude_airlines)
+    alliances = parse_alliances(params.alliance)
+    alliances_exclude = parse_alliances(params.exclude_alliance)
+
+    # Build time restrictions
+    departure_window = params.departure_window or CONFIG.default_departure_window
+    time_restrictions = build_time_restrictions(departure_window) if departure_window else None
+
+    # Build flight segments (pass full lists for multi-airport support)
+    segments, trip_type = build_flight_segments(
+        origin=origins,
+        destination=destinations,
+        departure_date=params.departure_date,
+        return_date=params.return_date,
+        time_restrictions=time_restrictions,
+    )
+
+    # Parse new filters
+    emissions_filter = parse_emissions(params.emissions)
+    bags_filter = None
+    if params.checked_bags > 0 or params.carry_on:
+        bags_filter = BagsFilter(checked_bags=params.checked_bags, carry_on=params.carry_on)
+
+    layover_restrictions = None
+    if params.min_layover is not None or params.max_layover is not None:
+        from fli.models import LayoverRestrictions
+
+        layover_restrictions = LayoverRestrictions(
+            min_duration=params.min_layover,
+            max_duration=params.max_layover,
+        )
+
+    filters = FlightSearchFilters(
+        trip_type=trip_type,
+        passenger_info=PassengerInfo(
+            adults=params.passengers,
+            children=params.children,
+            infants_in_seat=params.infants_in_seat,
+            infants_on_lap=params.infants_on_lap,
+        ),
+        flight_segments=segments,
+        stops=max_stops,
+        seat_type=cabin_class,
+        airlines=airlines,
+        airlines_exclude=airlines_exclude,
+        alliances=alliances,
+        alliances_exclude=alliances_exclude,
+        layover_restrictions=layover_restrictions,
+        sort_by=sort_by,
+        exclude_basic_economy=params.exclude_basic_economy,
+        emissions=emissions_filter,
+        bags=bags_filter,
+        show_all_results=params.show_all_results,
+    )
+    return filters, trip_type, origins, destinations
+
+
+def _search_error_message(exc: Exception, prefix: str = "Search failed") -> str:
+    """Render a search exception for an MCP response, with actionable hints.
+
+    `SearchParseError` means a page arrived that we could not read, which is
+    most often Google's regional consent interstitial. The CLI already points
+    at `FLI_SOCS_COOKIE` for that; an MCP caller has no log file to consult, so
+    it needs the hint in the response itself.
+    """
+    if isinstance(exc, SearchParseError):
+        return (
+            f"{prefix}: {exc} This is usually a transient page variant or a regional "
+            "consent interstitial — retry, or check FLI_SOCS_COOKIE if you are in the "
+            "EU/EEA."
+        )
+    # Everything else already carries its own actionable text —
+    # `SearchRejectedError` explains its code (the gated header, an invalid
+    # request, or Explore's intermittent refusal), and the client's typed
+    # errors name the host and what to check.
+    return f"{prefix}: {exc}"
 
 
 def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
     """Execute a flight search and return formatted results."""
     try:
-        # Parse inputs using shared utilities (supports comma-separated multi-airport)
-        origins = _resolve_airports(params.origin)
-        destinations = _resolve_airports(params.destination)
-        cabin_class = parse_cabin_class(params.cabin_class)
-        max_stops = parse_max_stops(params.max_stops)
-        sort_by = parse_sort_by(params.sort_by)
-        airlines = parse_airlines(params.airlines)
-        airlines_exclude = parse_airlines(params.exclude_airlines)
-        alliances = parse_alliances(params.alliance)
-        alliances_exclude = parse_alliances(params.exclude_alliance)
-
-        # Build time restrictions
-        departure_window = params.departure_window or CONFIG.default_departure_window
-        time_restrictions = build_time_restrictions(departure_window) if departure_window else None
-
-        # Build flight segments (pass full lists for multi-airport support)
-        segments, trip_type = build_flight_segments(
-            origin=origins,
-            destination=destinations,
-            departure_date=params.departure_date,
-            return_date=params.return_date,
-            time_restrictions=time_restrictions,
-        )
-
-        # Parse new filters
-        emissions_filter = parse_emissions(params.emissions)
-        bags_filter = None
-        if params.checked_bags > 0 or params.carry_on:
-            bags_filter = BagsFilter(checked_bags=params.checked_bags, carry_on=params.carry_on)
-
-        layover_restrictions = None
-        if params.min_layover is not None or params.max_layover is not None:
-            from fli.models import LayoverRestrictions
-
-            layover_restrictions = LayoverRestrictions(
-                min_duration=params.min_layover,
-                max_duration=params.max_layover,
-            )
-
-        # Create search filters
-        filters = FlightSearchFilters(
-            trip_type=trip_type,
-            passenger_info=PassengerInfo(adults=params.passengers),
-            flight_segments=segments,
-            stops=max_stops,
-            seat_type=cabin_class,
-            airlines=airlines,
-            airlines_exclude=airlines_exclude,
-            alliances=alliances,
-            alliances_exclude=alliances_exclude,
-            layover_restrictions=layover_restrictions,
-            sort_by=sort_by,
-            exclude_basic_economy=params.exclude_basic_economy,
-            emissions=emissions_filter,
-            bags=bags_filter,
-            show_all_results=params.show_all_results,
-        )
+        filters, trip_type, origins, destinations = _build_flight_filters(params)
 
         # Perform search
         currency = parse_currency(params.currency)
         search_client = SearchFlights()
         flights = search_client.search(
             filters,
+            top_n=params.top_n,
             currency=currency,
             language=params.language,
             country=params.country,
         )
 
-        if not flights:
-            return {"success": True, "flights": [], "count": 0, "trip_type": trip_type.name}
+        booking_url = _google_flights_url(
+            origins,
+            destinations,
+            params.departure_date,
+            params.return_date,
+            params.currency,
+            params.language,
+            params.country,
+        )
 
-        # Serialize results
+        if not flights:
+            response: dict[str, Any] = {
+                "success": True,
+                "flights": [],
+                "count": 0,
+                "trip_type": trip_type.name,
+                "booking_url": booking_url,
+            }
+            # Read the library's own verdict rather than recomputing "empty +
+            # children/infants" here: SearchFlights.search already knows
+            # whether the empty result traces back to a page Google itself
+            # served with zero rows, versus the caller's own airline/price/
+            # duration/window filter removing rows Google did inline — that
+            # distinction lives in the fetch path, not in params, so it can
+            # only be answered correctly once, there.
+            if search_client.sparse_passenger_mix:
+                response["note"] = SPARSE_PASSENGER_MIX_WARNING
+            return response
+
+        # Serialize results; attach per-flight deep-link booking URL.
         is_round_trip = trip_type == TripType.ROUND_TRIP
-        flight_results = [_serialize_flight_result(f, is_round_trip) for f in flights]
+        flight_results = [
+            _serialize_flight_result(
+                f,
+                is_round_trip,
+                booking_url=search_client.build_flight_booking_url(
+                    f,
+                    currency=params.currency,
+                    language=params.language,
+                    country=params.country,
+                    seat_type=filters.seat_type,
+                    passenger_info=filters.passenger_info,
+                ),
+            )
+            for f in flights
+        ]
 
         if CONFIG.max_results:
             flight_results = flight_results[: CONFIG.max_results]
@@ -488,15 +855,150 @@ def _execute_flight_search(params: FlightSearchParams) -> dict[str, Any]:
             "flights": flight_results,
             "count": len(flight_results),
             "trip_type": trip_type.name,
+            "booking_url": booking_url,
         }
 
     except ParseError as e:
-        return {"success": False, "error": str(e), "flights": []}
+        return {
+            "success": False,
+            "error": str(e),
+            "flights": [],
+            **classify_error(e).as_fields(),
+        }
+    except ValidationError as e:
+        return {
+            "success": False,
+            "error": format_validation_error(e),
+            "flights": [],
+            **classify_error(e).as_fields(),
+        }
     except Exception as e:
-        error_msg = str(e)
-        if "validation error" in error_msg.lower():
-            return {"success": False, "error": "Invalid parameter value", "flights": []}
-        return {"success": False, "error": f"Search failed: {error_msg}", "flights": []}
+        return {
+            "success": False,
+            "error": _search_error_message(e),
+            "flights": [],
+            **classify_error(e).as_fields(),
+        }
+
+
+def _execute_booking_options(
+    params: FlightSearchParams, flight_numbers: list[str] | None
+) -> dict[str, Any]:
+    """Fetch real bookable fares (vendor URLs + prices) for one itinerary.
+
+    Re-runs the search so the client captures a fresh shopping session,
+    selects the itinerary identified by ``flight_numbers`` (or the top
+    result when omitted), then calls
+    :meth:`fli.search.SearchFlights.get_booking_options` and serializes the
+    vendor list — each carrying a direct ``booking_url``. ``params.top_n``
+    is forwarded to the re-run search so a round-trip itinerary that was
+    only discoverable with a raised ``top_n`` (see :func:`search_flights`)
+    can still be matched here.
+    """
+    try:
+        filters, trip_type, origins, destinations = _build_flight_filters(params)
+
+        currency = parse_currency(params.currency)
+        search_client = SearchFlights()
+        flights = search_client.search(
+            filters,
+            top_n=params.top_n,
+            currency=currency,
+            language=params.language,
+            country=params.country,
+        )
+
+        booking_url = _google_flights_url(
+            origins,
+            destinations,
+            params.departure_date,
+            params.return_date,
+            params.currency,
+            params.language,
+            params.country,
+        )
+
+        if not flights:
+            return {"success": True, "options": [], "count": 0, "booking_url": booking_url}
+
+        flight = _match_flight(flights, flight_numbers)
+        if flight is None:
+            return {
+                "success": False,
+                "error": (
+                    "No flight matched the requested flight_numbers. Pass values "
+                    "from a prior search_flights result (e.g. ['BA178'] or ['178'])."
+                ),
+                "available_flights": [_flight_idents(f) for f in flights[:20]],
+                "options": [],
+                "booking_url": booking_url,
+                # Not an exception — the caller passed flight_numbers that don't
+                # match any result from this search. Deterministic and
+                # caller-fixable, same bucket as a bad parameter.
+                "error_type": "validation_error",
+                "retryable": False,
+            }
+
+        options = search_client.get_booking_options(
+            flight,
+            filters,
+            currency=currency,
+            language=params.language,
+            country=params.country,
+        )
+
+        is_round_trip = trip_type == TripType.ROUND_TRIP
+        flight_booking_url = search_client.build_flight_booking_url(
+            flight,
+            currency=params.currency,
+            language=params.language,
+            country=params.country,
+            seat_type=filters.seat_type,
+            passenger_info=filters.passenger_info,
+        )
+        serialized = [_serialize_booking_option(o) for o in options]
+        result = {
+            "success": True,
+            "selected_flight": _serialize_flight_result(
+                flight, is_round_trip, booking_url=flight_booking_url
+            ),
+            "options": serialized,
+            "count": len(serialized),
+            "booking_url": booking_url,
+        }
+        if not serialized:
+            # Google's GetBookingResults frequently returns no vendors without a
+            # browser-minted session token that fli does not reproduce server-side.
+            # The per-flight deep link in selected_flight.booking_url opens the
+            # specific itinerary's booking page directly.
+            result["note"] = (
+                "Google returned no per-vendor booking fares for this itinerary. "
+                "Use selected_flight.booking_url to open the specific flight's "
+                "booking page on Google Flights."
+            )
+        return result
+
+    except ParseError as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "options": [],
+            **classify_error(e).as_fields(),
+        }
+    except ValidationError as e:
+        return {
+            "success": False,
+            "error": format_validation_error(e),
+            "options": [],
+            **classify_error(e).as_fields(),
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": _search_error_message(e, "Booking lookup failed"),
+            "options": [],
+            **classify_error(e).as_fields(),
+        }
 
 
 def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
@@ -538,7 +1040,12 @@ def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
         # Create search filters
         filters = DateSearchFilters(
             trip_type=trip_type,
-            passenger_info=PassengerInfo(adults=params.passengers),
+            passenger_info=PassengerInfo(
+                adults=params.passengers,
+                children=params.children,
+                infants_in_seat=params.infants_in_seat,
+                infants_on_lap=params.infants_on_lap,
+            ),
             flight_segments=segments,
             stops=max_stops,
             seat_type=cabin_class,
@@ -575,7 +1082,8 @@ def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
             dates.sort(key=lambda x: x.price)
 
         # Serialize results
-        date_results = [_serialize_date_result(d) for d in dates]
+        locale = (params.currency, params.language, params.country)
+        date_results = [_serialize_date_result(d, origins, destinations, locale) for d in dates]
 
         if CONFIG.max_results:
             date_results = date_results[: CONFIG.max_results]
@@ -590,9 +1098,243 @@ def _execute_date_search(params: DateSearchParams) -> dict[str, Any]:
         }
 
     except ParseError as e:
-        return {"success": False, "error": str(e), "dates": []}
+        return {
+            "success": False,
+            "error": str(e),
+            "dates": [],
+            **classify_error(e).as_fields(),
+        }
+    except ValidationError as e:
+        return {
+            "success": False,
+            "error": format_validation_error(e),
+            "dates": [],
+            **classify_error(e).as_fields(),
+        }
     except Exception as e:
-        return {"success": False, "error": f"Search failed: {str(e)}", "dates": []}
+        return {
+            "success": False,
+            "error": _search_error_message(e),
+            "dates": [],
+            **classify_error(e).as_fields(),
+        }
+
+
+def _parse_explore_origin(value: str) -> Airport | ExplorePlace:
+    """Resolve an explore origin: airport IATA code or a city knowledge-graph mid."""
+    cleaned = value.strip()
+    if cleaned.startswith(KG_MID_PREFIXES):
+        # City/metro type — the only origin mid type observed in captures.
+        return ExplorePlace(mid=cleaned, type_code=4)
+    return resolve_airport(cleaned)
+
+
+def _parse_explore_destination(value: str) -> ExploreRegion | ExplorePlace:
+    """Resolve an explore destination: a region name or a knowledge-graph mid.
+
+    An airport code raises ``ParseError`` pointing at ``search_flights``.
+    """
+    cleaned = value.strip()
+    if cleaned.startswith(KG_MID_PREFIXES):
+        # Sent as a region (type 6). Region, continent and country mids work;
+        # a city mid comes back empty and surfaces as a parse_error.
+        return ExplorePlace(mid=cleaned)
+    region_key = cleaned.upper().replace(" ", "_").replace("-", "_")
+    if region_key in ExploreRegion.__members__:
+        return ExploreRegion[region_key]
+    regions = ", ".join(ExploreRegion.__members__)
+    try:
+        airport = resolve_airport(cleaned)
+    except ParseError:
+        raise ParseError(
+            f"Unknown explore destination '{value}'. Use one of: {regions}; "
+            "or a knowledge-graph mid for a region or country, like '/m/07ssc'."
+        ) from None
+    raise ParseError(
+        f"Explore cannot search to a single airport ('{airport.name.removeprefix('_')}'): "
+        f"Google rejects it. Use search_flights or search_dates for that route, or "
+        f"explore one of: {regions}; or a region or country mid like '/m/07ssc'."
+    )
+
+
+def _serialize_explore_destination(
+    destination: Any,
+    origin_label: str | None,
+    locale: tuple[str | None, str | None, str | None],
+    exact_nights: int | None = None,
+) -> dict[str, Any]:
+    """Serialize one explore destination for tool output.
+
+    ``exact_nights`` is set only when a round-trip search pinned the trip
+    length to a single value — the one case where the return date is
+    derivable as fact. Google's Explore response does not reveal the chosen
+    return date otherwise (verified by live probing: no destination-record
+    slot, price-record slot, or booking-token field moves when the
+    trip-length window changes).
+    """
+    currency, language, country = locale
+    entry: dict[str, Any] = {
+        "name": destination.name,
+        "country": destination.country,
+        "mid": destination.mid,
+        "price": destination.price,
+        "currency": (
+            destination.currency or CONFIG.default_currency
+            if destination.price is not None
+            else destination.currency
+        ),
+        "departure_date": destination.departure_date,
+        "arrival_date": destination.arrival_date,
+        "airline": destination.airline,
+        "airline_name": destination.airline_name,
+        "stops": destination.stops,
+        "duration_minutes": destination.duration_minutes,
+        "destination_airport": destination.destination_airport,
+        "latitude": destination.latitude,
+        "longitude": destination.longitude,
+        "image_url": destination.hero_image_url or destination.thumbnail_url,
+    }
+    if origin_label and destination.destination_airport and destination.departure_date:
+        link_return_date = None
+        if exact_nights is not None:
+            # The date comes from Google's response, so a malformed one must
+            # only drop the return date from this link, not fail the search
+            # (a bare ValueError would also be misreported as the caller's
+            # validation_error).
+            try:
+                departure = datetime.strptime(destination.departure_date, "%Y-%m-%d")
+            except ValueError:
+                pass
+            else:
+                link_return_date = (departure + timedelta(days=exact_nights)).strftime("%Y-%m-%d")
+        entry["flights_url"] = google_flights_url(
+            origin_label,
+            destination.destination_airport,
+            destination.departure_date,
+            link_return_date,
+            currency=currency,
+            language=language,
+            country=country,
+        )
+    return entry
+
+
+def _execute_explore_search(params: ExploreSearchParams) -> dict[str, Any]:
+    """Execute an explore search and return formatted results."""
+    try:
+        origin = _parse_explore_origin(params.origin)
+        destination = _parse_explore_destination(params.destination)
+        cabin_class = parse_cabin_class(params.cabin_class)
+        max_stops = parse_max_stops(params.max_stops)
+        airlines = parse_airlines(params.airlines)
+        airlines_exclude = parse_airlines(params.exclude_airlines)
+        alliances = parse_alliances(params.alliance)
+        alliances_exclude = parse_alliances(params.exclude_alliance)
+        currency = parse_currency(params.currency)
+
+        trip_length_window = None
+        if params.round_trip:
+            # Explore quotes one-way prices for a range of nights, so a round
+            # trip must pin the length (see ExploreSearchFilters).
+            nights = {n for n in (params.trip_min_nights, params.trip_max_nights) if n is not None}
+            if len(nights) != 1 or min(nights) < 1:
+                raise ParseError(
+                    "Round-trip explore needs a fixed trip length: set trip_min_nights "
+                    "(and trip_max_nights, if given) to the same number of nights, 1 to 23. "
+                    "For a range of nights Google quotes one-way prices, so round-trip "
+                    "fares would be wrong. Search a few fixed lengths instead."
+                )
+            (pinned,) = nights
+            trip_length_window = [4, 23, pinned, pinned]
+        elif params.trip_min_nights is not None or params.trip_max_nights is not None:
+            min_nights = params.trip_min_nights if params.trip_min_nights is not None else 0
+            max_nights = params.trip_max_nights if params.trip_max_nights is not None else 23
+            if min_nights > max_nights:
+                raise ParseError(
+                    f"trip_min_nights ({min_nights}) cannot exceed trip_max_nights ({max_nights})"
+                )
+            trip_length_window = [4, 23, min_nights, max_nights]
+
+        filters = ExploreSearchFilters(
+            trip_type=TripType.ROUND_TRIP if params.round_trip else TripType.ONE_WAY,
+            passenger_info=PassengerInfo(adults=params.passengers),
+            origin=origin,
+            destination=destination,
+            departure_date=params.departure_date,
+            stops=max_stops,
+            seat_type=cabin_class,
+            price_limit=PriceLimit(max_price=params.max_price) if params.max_price else None,
+            airlines=airlines,
+            airlines_exclude=airlines_exclude,
+            alliances=alliances,
+            alliances_exclude=alliances_exclude,
+            max_duration=params.max_flight_duration,
+            trip_length_window=trip_length_window,
+        )
+
+        result = SearchExplore().search(
+            filters,
+            currency=currency,
+            language=params.language,
+            country=params.country,
+        )
+
+        destinations = list(result.destinations)
+        if params.sort_by_price:
+            destinations.sort(key=lambda d: (d.price is None, d.price or 0))
+
+        # FLI_MCP_MAX_RESULTS caps every tool's output; a caller's own limit
+        # can narrow it further but never raise it.
+        limits = [n for n in (params.limit, CONFIG.max_results) if n]
+        if limits:
+            destinations = destinations[: min(limits)]
+
+        origin_label = (
+            origin.name.removeprefix("_") if isinstance(origin, Airport) else result.origin_name
+        )
+        locale = (params.currency, params.language, params.country)
+        # The return date is only knowable when the trip length is pinned to
+        # a single value; Google's response never reveals it otherwise.
+        exact_nights = trip_length_window[2] if params.round_trip and trip_length_window else None
+        serialized = [
+            _serialize_explore_destination(d, origin_label, locale, exact_nights)
+            for d in destinations
+        ]
+
+        return {
+            "success": True,
+            "origin": params.origin,
+            "origin_name": result.origin_name,
+            "destination": params.destination,
+            "region_name": result.region_name,
+            "departure_date": params.departure_date,
+            "trip_type": "ROUND_TRIP" if params.round_trip else "ONE_WAY",
+            "count": len(serialized),
+            "priced_count": sum(1 for d in serialized if d["price"] is not None),
+            "destinations": serialized,
+        }
+
+    except ParseError as e:
+        return {
+            "success": False,
+            "error": str(e),
+            "destinations": [],
+            **classify_error(e).as_fields(),
+        }
+    except ValidationError as e:
+        return {
+            "success": False,
+            "error": format_validation_error(e),
+            "destinations": [],
+            **classify_error(e).as_fields(),
+        }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": _search_error_message(e),
+            "destinations": [],
+            **classify_error(e).as_fields(),
+        }
 
 
 # =============================================================================
@@ -654,21 +1396,37 @@ def search_flights(
         int | None,
         Field(description="Number of adult passengers", ge=1),
     ] = None,
+    children: Annotated[
+        int,
+        Field(description="Number of children (ages 2-11)", ge=0),
+    ] = 0,
+    infants_in_seat: Annotated[
+        int,
+        Field(description="Number of infants (under 2) occupying their own seat", ge=0),
+    ] = 0,
+    infants_on_lap: Annotated[
+        int,
+        Field(description="Number of lap infants (under 2, no seat)", ge=0),
+    ] = 0,
     exclude_basic_economy: Annotated[
         bool,
-        Field(description="Exclude basic economy fares from results"),
+        Field(description=f"Exclude basic economy fares from results. {_IGNORED_BY_TRANSPORT}"),
     ] = False,
     emissions: Annotated[
         str,
-        Field(description="Filter by emissions level: ALL or LESS"),
+        Field(description=f"Filter by emissions level: ALL or LESS. {_IGNORED_BY_TRANSPORT}"),
     ] = "ALL",
     checked_bags: Annotated[
         int,
-        Field(description="Number of checked bags to include in price (0, 1, or 2)", ge=0, le=2),
+        Field(
+            description=f"Number of checked bags in price (0-2). {_IGNORED_BY_TRANSPORT}",
+            ge=0,
+            le=2,
+        ),
     ] = 0,
     carry_on: Annotated[
         bool,
-        Field(description="Include carry-on bag fee in displayed price"),
+        Field(description=f"Include carry-on bag fee in displayed price. {_IGNORED_BY_TRANSPORT}"),
     ] = False,
     show_all_results: Annotated[
         bool,
@@ -711,11 +1469,32 @@ def search_flights(
         int | None,
         Field(description="Maximum layover duration in minutes.", ge=1),
     ] = None,
+    top_n: Annotated[
+        int,
+        Field(
+            description=(
+                "Round-trip only: number of outbound options to expand into return-flight "
+                "combinations. Cost is `1 + top_n` page fetches. Round-trip results all "
+                "from one airline? Raise top_n to see more carriers (max 10) — the default "
+                "sort otherwise only expands the cheapest 5 outbounds, which are often the "
+                "same carrier. Ignored for one-way searches."
+            ),
+            ge=1,
+            le=10,
+        ),
+    ] = 5,
 ) -> dict[str, Any]:
     """Search for flights between two airports on a specific date.
 
     Returns a list of available flights with prices, durations, and leg details.
     Supports one-way and round-trip searches with various filtering options.
+
+    On failure (`success: false`), the response also carries `error_type`
+    (e.g. `validation_error`, `timeout`, `parse_error`) and a `retryable`
+    bool — classify the failure from `error_type` instead of parsing the
+    `error` message text. The client has already retried internally with
+    backoff; if `retryable` is true, retry at most once or twice more with
+    your own exponential backoff in seconds (429 means slow down further).
     """
     effective_departure_window = departure_window or CONFIG.default_departure_window
     params = FlightSearchParams(
@@ -729,6 +1508,9 @@ def search_flights(
         max_stops=max_stops,
         sort_by=sort_by,
         passengers=passengers or CONFIG.default_passengers,
+        children=children,
+        infants_in_seat=infants_in_seat,
+        infants_on_lap=infants_on_lap,
         exclude_basic_economy=exclude_basic_economy,
         emissions=emissions,
         checked_bags=checked_bags,
@@ -738,6 +1520,7 @@ def search_flights(
         language=language,
         country=country,
         exclude_airlines=exclude_airlines,
+        top_n=top_n,
         alliance=alliance,
         exclude_alliance=exclude_alliance,
         min_layover=min_layover,
@@ -774,7 +1557,15 @@ def search_dates(
         ),
     ],
     start_date: Annotated[str, Field(description="Start of date range in YYYY-MM-DD format")],
-    end_date: Annotated[str, Field(description="End of date range in YYYY-MM-DD format")],
+    end_date: Annotated[
+        str,
+        Field(
+            description=(
+                "End of date range in YYYY-MM-DD format. A range may span at most "
+                f"{MAX_DATES_PER_SEARCH} dates; each date costs its own page fetch."
+            )
+        ),
+    ],
     trip_duration: Annotated[
         int,
         Field(description="Trip duration in days for round-trips", ge=1),
@@ -807,6 +1598,18 @@ def search_dates(
         int | None,
         Field(description="Number of adult passengers", ge=1),
     ] = None,
+    children: Annotated[
+        int,
+        Field(description="Number of children (ages 2-11)", ge=0),
+    ] = 0,
+    infants_in_seat: Annotated[
+        int,
+        Field(description="Number of infants (under 2) occupying their own seat", ge=0),
+    ] = 0,
+    infants_on_lap: Annotated[
+        int,
+        Field(description="Number of lap infants (under 2, no seat)", ge=0),
+    ] = 0,
     currency: Annotated[
         str | None,
         Field(description="ISO 4217 currency code (USD, EUR, GBP, JPY...) for prices."),
@@ -844,6 +1647,13 @@ def search_dates(
 
     Returns a list of dates with their prices, useful for flexible travel planning.
     Supports both one-way and round-trip searches.
+
+    On failure (`success: false`), the response also carries `error_type`
+    (e.g. `validation_error`, `timeout`, `parse_error`) and a `retryable`
+    bool — classify the failure from `error_type` instead of parsing the
+    `error` message text. The client has already retried internally with
+    backoff; if `retryable` is true, retry at most once or twice more with
+    your own exponential backoff in seconds (429 means slow down further).
     """
     effective_departure_window = departure_window or CONFIG.default_departure_window
     params = DateSearchParams(
@@ -859,6 +1669,9 @@ def search_dates(
         departure_window=effective_departure_window,
         sort_by_price=sort_by_price,
         passengers=passengers or CONFIG.default_passengers,
+        children=children,
+        infants_in_seat=infants_in_seat,
+        infants_on_lap=infants_on_lap,
         currency=currency,
         language=language,
         country=country,
@@ -876,6 +1689,355 @@ def _search_dates_from_params(params: DateSearchParams) -> dict[str, Any]:
     return _execute_date_search(params)
 
 
+@mcp.tool(
+    annotations={
+        "title": "Explore Destinations",
+        "readOnlyHint": True,
+        "idempotentHint": True,
+    },
+)
+def search_explore(
+    origin: Annotated[
+        str,
+        Field(
+            description="Departure airport IATA code (e.g., 'JFK'), or a Google "
+            "knowledge-graph mid for a city (e.g., '/m/04jpl' for London)"
+        ),
+    ],
+    departure_date: Annotated[str, Field(description="Departure date in YYYY-MM-DD format")],
+    destination: Annotated[
+        str,
+        Field(
+            description="Where to explore: ANYWHERE, EUROPE, SOUTHERN_EUROPE, ASIA, "
+            "AFRICA, NORTH_AMERICA, SOUTH_AMERICA, OCEANIA, or a knowledge-graph mid for "
+            "a region or country (e.g., '/m/07ssc' for the UK). Not an airport or city: "
+            "use search_flights for a specific destination"
+        ),
+    ] = "ANYWHERE",
+    round_trip: Annotated[
+        bool,
+        Field(
+            description="Price round trips instead of one-ways. Requires a fixed trip "
+            "length: set trip_min_nights (and trip_max_nights, if given) to the same value"
+        ),
+    ] = False,
+    trip_min_nights: Annotated[
+        int | None,
+        Field(description="Trip length in nights (round trips must pin one value)", ge=0, le=23),
+    ] = None,
+    trip_max_nights: Annotated[
+        int | None,
+        Field(description="Must equal trip_min_nights for round trips", ge=0, le=23),
+    ] = None,
+    max_price: Annotated[
+        int | None,
+        Field(description="Maximum price cap for fares", gt=0),
+    ] = None,
+    cabin_class: Annotated[
+        str,
+        Field(description="Cabin class: ECONOMY, PREMIUM_ECONOMY, BUSINESS, FIRST"),
+    ] = CONFIG.default_cabin_class,
+    max_stops: Annotated[
+        str,
+        Field(description="Maximum stops: ANY, NON_STOP, ONE_STOP, TWO_PLUS_STOPS"),
+    ] = "ANY",
+    airlines: Annotated[
+        list[str] | None,
+        Field(description="Filter by airline IATA codes (e.g., ['BA', 'AA'])"),
+    ] = None,
+    exclude_airlines: Annotated[
+        list[str] | None,
+        Field(description="Airline IATA codes to EXCLUDE from results."),
+    ] = None,
+    alliance: Annotated[
+        list[str] | None,
+        Field(description="Restrict to alliances: ONEWORLD, SKYTEAM, STAR_ALLIANCE."),
+    ] = None,
+    exclude_alliance: Annotated[
+        list[str] | None,
+        Field(description="Alliance names to EXCLUDE from results."),
+    ] = None,
+    max_flight_duration: Annotated[
+        int | None,
+        Field(description="Maximum flight duration in minutes", gt=0),
+    ] = None,
+    passengers: Annotated[
+        int | None,
+        Field(description="Number of adult passengers", ge=1),
+    ] = None,
+    currency: Annotated[
+        str | None,
+        Field(description="ISO 4217 currency code (USD, EUR, GBP, JPY...) for prices."),
+    ] = None,
+    language: Annotated[
+        str | None,
+        Field(description="Optional BCP-47 language code (e.g., 'en-GB') for the `hl` URL param."),
+    ] = None,
+    country: Annotated[
+        str | None,
+        Field(description="Optional ISO 3166-1 alpha-2 country code (e.g., 'GB')."),
+    ] = None,
+    sort_by_price: Annotated[
+        bool,
+        Field(description="Sort destinations by price (lowest first)"),
+    ] = True,
+    limit: Annotated[
+        int | None,
+        Field(description="Maximum number of destinations to return", gt=0),
+    ] = None,
+) -> dict[str, Any]:
+    """Discover where you can fly cheaply when the destination is flexible.
+
+    Use this when the user asks "where can I go?", "cheapest places to fly",
+    or gives a broad destination like a continent instead of a city. One call
+    returns dozens of destinations with their cheapest fares (some come back
+    unpriced — Google found no itinerary matching the filters for them).
+
+    Follow up with `search_flights` using a result's `destination_airport`
+    and `departure_date` for bookable itineraries; each priced destination
+    also carries a `flights_url` deep link, which for round trips includes
+    the return date.
+
+    Round trips need a fixed trip length (e.g. trip_min_nights=7): for a
+    range of nights Google quotes one-way prices. Destinations must be a
+    region, continent or country; for a specific airport use search_flights.
+    Google intermittently refuses Explore requests; the tool retries a few
+    times, and a `rejected_error` with `retryable: true` is worth one more
+    try after a few seconds.
+    """
+    params = ExploreSearchParams(
+        origin=origin,
+        destination=destination,
+        departure_date=departure_date,
+        round_trip=round_trip,
+        trip_min_nights=trip_min_nights,
+        trip_max_nights=trip_max_nights,
+        max_price=max_price,
+        cabin_class=cabin_class,
+        max_stops=max_stops,
+        airlines=airlines,
+        exclude_airlines=exclude_airlines,
+        alliance=alliance,
+        exclude_alliance=exclude_alliance,
+        max_flight_duration=max_flight_duration,
+        passengers=passengers or CONFIG.default_passengers,
+        currency=currency,
+        language=language,
+        country=country,
+        sort_by_price=sort_by_price,
+        limit=limit,
+    )
+    return _execute_explore_search(params)
+
+
+def _search_explore_from_params(params: ExploreSearchParams) -> dict[str, Any]:
+    """Entry point for tests that call the tool via a params object."""
+    return _execute_explore_search(params)
+
+
+@mcp.tool(
+    annotations={
+        "title": "Get Booking Options",
+        "readOnlyHint": True,
+        "idempotentHint": True,
+    },
+)
+def get_booking_options(
+    origin: Annotated[
+        str,
+        Field(description="Departure airport IATA code(s), comma-separated for multiple"),
+    ],
+    destination: Annotated[
+        str,
+        Field(description="Arrival airport IATA code(s), comma-separated for multiple"),
+    ],
+    departure_date: Annotated[str, Field(description="Travel date in YYYY-MM-DD format")],
+    flight_numbers: Annotated[
+        list[str] | None,
+        Field(
+            description=(
+                "Flight numbers identifying the itinerary to price, in order, taken from a "
+                "prior search_flights result (e.g. ['BA178'] one-way, ['AA100', 'AA200'] "
+                "round-trip). Accepts bare numbers ('178') or airline-prefixed ('BA178'). "
+                "Omit to price the top result."
+            )
+        ),
+    ] = None,
+    return_date: Annotated[
+        str | None,
+        Field(description="Return date in YYYY-MM-DD format (omit for one-way)"),
+    ] = None,
+    cabin_class: Annotated[
+        str,
+        Field(description="Cabin class: ECONOMY, PREMIUM_ECONOMY, BUSINESS, FIRST"),
+    ] = CONFIG.default_cabin_class,
+    max_stops: Annotated[
+        str,
+        Field(description="Maximum stops: ANY, NON_STOP, ONE_STOP, TWO_PLUS_STOPS"),
+    ] = "ANY",
+    passengers: Annotated[
+        int | None,
+        Field(description="Number of adult passengers", ge=1),
+    ] = None,
+    children: Annotated[
+        int,
+        Field(description="Number of children (ages 2-11)", ge=0),
+    ] = 0,
+    infants_in_seat: Annotated[
+        int,
+        Field(description="Number of infants (under 2) occupying their own seat", ge=0),
+    ] = 0,
+    infants_on_lap: Annotated[
+        int,
+        Field(description="Number of lap infants (under 2, no seat)", ge=0),
+    ] = 0,
+    airlines: Annotated[
+        list[str] | None,
+        Field(description="Filter by airline IATA codes (e.g., ['BA', 'AA'])"),
+    ] = None,
+    exclude_basic_economy: Annotated[
+        bool,
+        Field(description=f"Exclude basic economy fares from results. {_IGNORED_BY_TRANSPORT}"),
+    ] = False,
+    currency: Annotated[
+        str | None,
+        Field(description="ISO 4217 currency code (USD, EUR, GBP, JPY...) for prices."),
+    ] = None,
+    language: Annotated[
+        str | None,
+        Field(description="Optional BCP-47 language code (e.g., 'en-GB') for the `hl` URL param."),
+    ] = None,
+    country: Annotated[
+        str | None,
+        Field(description="Optional ISO 3166-1 alpha-2 country code (e.g., 'GB')."),
+    ] = None,
+    departure_window: Annotated[
+        str | None,
+        Field(description="Departure time window in 'HH-HH' 24h format (e.g., '6-20')"),
+    ] = None,
+    sort_by: Annotated[
+        str,
+        Field(
+            description="Sort by: TOP_FLIGHTS, BEST, CHEAPEST,"
+            " DEPARTURE_TIME, ARRIVAL_TIME, DURATION, EMISSIONS"
+        ),
+    ] = CONFIG.default_sort_by,
+    exclude_airlines: Annotated[
+        list[str] | None,
+        Field(description="Airline IATA codes to EXCLUDE from results."),
+    ] = None,
+    alliance: Annotated[
+        list[str] | None,
+        Field(description="Restrict to alliances: ONEWORLD, SKYTEAM, STAR_ALLIANCE."),
+    ] = None,
+    exclude_alliance: Annotated[
+        list[str] | None,
+        Field(description="Alliance names to EXCLUDE from results."),
+    ] = None,
+    min_layover: Annotated[
+        int | None,
+        Field(description="Minimum layover duration in minutes.", ge=1),
+    ] = None,
+    max_layover: Annotated[
+        int | None,
+        Field(description="Maximum layover duration in minutes.", ge=1),
+    ] = None,
+    emissions: Annotated[
+        str,
+        Field(description=f"Filter by emissions level: ALL or LESS. {_IGNORED_BY_TRANSPORT}"),
+    ] = "ALL",
+    checked_bags: Annotated[
+        int,
+        Field(
+            description=f"Number of checked bags in price (0-2). {_IGNORED_BY_TRANSPORT}",
+            ge=0,
+            le=2,
+        ),
+    ] = 0,
+    carry_on: Annotated[
+        bool,
+        Field(description=f"Include carry-on bag fee in displayed price. {_IGNORED_BY_TRANSPORT}"),
+    ] = False,
+    top_n: Annotated[
+        int,
+        Field(
+            description=(
+                "Round-trip only: number of outbound options the re-run search expands "
+                "into return-flight combinations — pass the same value used for the "
+                "search_flights call that found this itinerary, or a flight found with a "
+                "higher top_n may not be reproduced here. Cost is `1 + top_n` page fetches. "
+                "Ignored for one-way searches."
+            ),
+            ge=1,
+            le=10,
+        ),
+    ] = 5,
+) -> dict[str, Any]:
+    """Get bookable fares (vendor names, prices, and direct booking URLs) for a flight.
+
+    Runs a fresh search, selects the itinerary identified by ``flight_numbers``
+    (or the top result when omitted), and returns the airline-direct and
+    online-travel-agency options Google surfaces for it — each with a
+    clickable ``booking_url``. Use ``search_flights`` first to discover the
+    flight numbers, then call this tool to retrieve where and at what price
+    it can be booked.
+
+    Pass the same filters (``sort_by``, ``departure_window``, ``top_n``,
+    ``exclude_airlines``, ``alliance``, layover/bags/emissions, …) that were
+    used for ``search_flights`` so the re-run search reproduces the same result
+    set — otherwise, when ``flight_numbers`` is omitted, the priced "top
+    result" may differ from the one the user saw, and a flight found only
+    because ``search_flights`` was called with a higher ``top_n`` may not be
+    found at all.
+
+    On failure (``success: false``, including "no flight matched
+    flight_numbers"), the response also carries ``error_type`` (e.g.
+    ``validation_error``, ``rejected_error``) and a ``retryable`` bool —
+    classify the failure from ``error_type`` instead of parsing the
+    ``error`` message text. The client has already retried internally with
+    backoff; if ``retryable`` is true, retry at most once or twice more
+    with your own exponential backoff in seconds (429 means slow down
+    further).
+    """
+    effective_departure_window = departure_window or CONFIG.default_departure_window
+    params = FlightSearchParams(
+        origin=origin,
+        destination=destination,
+        departure_date=departure_date,
+        return_date=return_date,
+        departure_window=effective_departure_window,
+        cabin_class=cabin_class,
+        max_stops=max_stops,
+        sort_by=sort_by,
+        passengers=passengers or CONFIG.default_passengers,
+        children=children,
+        infants_in_seat=infants_in_seat,
+        infants_on_lap=infants_on_lap,
+        airlines=airlines,
+        exclude_basic_economy=exclude_basic_economy,
+        emissions=emissions,
+        checked_bags=checked_bags,
+        carry_on=carry_on,
+        currency=currency,
+        language=language,
+        country=country,
+        exclude_airlines=exclude_airlines,
+        alliance=alliance,
+        exclude_alliance=exclude_alliance,
+        min_layover=min_layover,
+        max_layover=max_layover,
+        top_n=top_n,
+    )
+    return _execute_booking_options(params, flight_numbers)
+
+
+def _get_booking_options_from_params(
+    params: FlightSearchParams, flight_numbers: list[str] | None = None
+) -> dict[str, Any]:
+    """Entry point for tests that call the tool via a params object."""
+    return _execute_booking_options(params, flight_numbers)
+
+
 def _find_airports_impl(query: str, limit: int = 10) -> dict[str, Any]:
     """Run search_airports and shape the result into the MCP response dict."""
     try:
@@ -885,6 +2047,7 @@ def _find_airports_impl(query: str, limit: int = 10) -> dict[str, Any]:
             "success": False,
             "error": str(exc),
             "query": query,
+            **classify_error(exc).as_fields(),
         }
 
     return {
@@ -909,17 +2072,24 @@ def find_airports(
         str,
         Field(
             description=(
-                "City name, airport name, or IATA code (e.g., 'new york', 'heathrow', 'JFK')"
+                "City name, airport name, IATA code, or ICAO code "
+                "(e.g., 'new york', 'heathrow', 'JFK', 'KJFK')"
             )
         ),
     ],
     limit: Annotated[int, Field(description="Maximum results to return", ge=1, le=50)] = 10,
 ) -> dict[str, Any]:
-    """Search for airports by city name, airport name, or IATA code.
+    """Search for airports by city name, airport name, IATA code, or ICAO code.
 
     Use this tool to find airport IATA codes before searching for flights.
     Supports city names (e.g., "new york" returns JFK, LGA, EWR),
-    airport names (e.g., "heathrow" returns LHR), and IATA codes.
+    airport names (e.g., "heathrow" returns LHR), IATA codes, and 4-letter
+    ICAO codes (e.g., "KJFK" returns JFK).
+
+    On failure (``success: false``), the response also carries ``error_type``
+    (currently always ``unexpected_error`` for this tool, since airport
+    lookup is local and has no known-transient failure modes) and a
+    ``retryable`` bool.
     """
     return _find_airports_impl(query, limit=limit)
 

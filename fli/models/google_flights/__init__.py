@@ -12,13 +12,25 @@ from .base import (
     LayoverRestrictions,
     MaxStops,
     PassengerInfo,
+    PowerType,
     PriceLimit,
+    SeatQuality,
     SeatType,
     SortBy,
     TimeRestrictions,
     TripType,
+    VideoType,
+    WifiTier,
 )
 from .dates import DateSearchFilters
+from .explore import (
+    ExploreDestination,
+    ExplorePlace,
+    ExplorePlaceType,
+    ExploreRegion,
+    ExploreResult,
+    ExploreSearchFilters,
+)
 from .flights import FlightSearchFilters
 
 __all__ = [
@@ -31,6 +43,12 @@ __all__ = [
     "Currency",
     "DateSearchFilters",
     "EmissionsFilter",
+    "ExploreDestination",
+    "ExplorePlace",
+    "ExplorePlaceType",
+    "ExploreRegion",
+    "ExploreResult",
+    "ExploreSearchFilters",
     "FlightLeg",
     "FlightResult",
     "FlightSearchFilters",
@@ -39,9 +57,13 @@ __all__ = [
     "LayoverRestrictions",
     "MaxStops",
     "PassengerInfo",
+    "PowerType",
     "PriceLimit",
+    "SeatQuality",
     "SeatType",
     "SortBy",
     "TimeRestrictions",
     "TripType",
+    "VideoType",
+    "WifiTier",
 ]

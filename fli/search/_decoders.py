@@ -13,6 +13,7 @@ booking-option row).
 from __future__ import annotations
 
 import logging
+import math
 from datetime import datetime
 from typing import Any
 
@@ -22,10 +23,14 @@ from fli.models import (
     Airport,
     Amenities,
     BookingOption,
+    ExploreDestination,
+    ExploreResult,
     FlightLeg,
     FlightResult,
     Layover,
+    SeatType,
 )
+from fli.models.google_flights.explore import KG_MID_PREFIXES
 from fli.search._helpers import as_bool, as_int, as_non_negative_int, as_str, safe_get
 
 logger = logging.getLogger(__name__)
@@ -85,12 +90,13 @@ def _parse_leg(fl: list) -> FlightLeg:
     op_code = safe_get(airline_info, 2)
     operating_airline = _safe_airline(op_code) if op_code else None
 
-    amenities = _parse_amenities(safe_get(fl, 12))
     aircraft = as_str(safe_get(fl, 17))
     legroom_short = as_str(safe_get(fl, 14))
     legroom_long = as_str(safe_get(fl, 30))
+    amenities = _parse_amenities(safe_get(fl, 12), safe_get(fl, 13), legroom_short or legroom_long)
     overnight = as_bool(safe_get(fl, 19)) or False
     co2_emissions_g = as_non_negative_int(safe_get(fl, 31))
+    cabin = _parse_cabin(safe_get(fl, 16))
 
     return FlightLeg(
         airline=airline,
@@ -110,38 +116,174 @@ def _parse_leg(fl: list) -> FlightLeg:
         amenities=amenities,
         overnight=overnight,
         co2_emissions_g=co2_emissions_g,
+        cabin=cabin,
     )
 
 
-def _parse_amenities(slots: Any) -> Amenities | None:
-    """Decode the 12-slot amenities array at ``leg[12]``.
+def _parse_cabin(code: Any) -> SeatType | None:
+    """Decode the per-leg cabin code at ``leg[16]`` into a :class:`SeatType`.
 
-    Confirmed slot mapping (live captures, May 2026):
-
-    - slot 1 → wifi (bool|None)
-    - slot 5 → power outlet (bool|None)
-    - slot 9 → on-demand video (bool|None)
-    - slot 11 → integer legroom rating (2 or 3 observed)
-
-    Returns None when none of the known slots carry a usable value (avoids
-    creating empty ``Amenities`` instances that would imply we know nothing
-    about the leg).
+    Google uses the same 1..4 numbering here as in the request filters
+    (1 economy, 2 premium economy, 3 business, 4 first). Unknown codes
+    return None rather than raising — the leg is still usable.
     """
-    if not isinstance(slots, list) or not slots:
+    value = as_non_negative_int(code)
+    if value is None:
         return None
-    wifi = as_bool(safe_get(slots, 1))
-    power = as_bool(safe_get(slots, 5))
-    on_demand_video = as_bool(safe_get(slots, 9))
-    legroom_rating = as_non_negative_int(safe_get(slots, 11))
-    if wifi is None and power is None and on_demand_video is None and legroom_rating is None:
+    try:
+        return SeatType(value)
+    except ValueError:
+        logger.debug("Unknown cabin code %r at leg[16]", value)
         return None
+
+
+# --- leg[12] amenity slot map (issue #217) --------------------------------
+#
+# ``leg[12]`` is a sparse array of amenity flags, trailing nulls trimmed.
+# Two mutually-exclusive groups plus a Wi-Fi tier code were confirmed by
+# tabulating all 481 leg instances across the captured fixtures (plus
+# three live public-page captures) against published fleet facts:
+#
+#   slots 1..6  power group — exactly one is ever set on a leg.
+#   slots 8..10 video group — exactly one is ever set on a leg.
+#   slot 11     Wi-Fi tier code (an int, never a bool).
+#
+# Slots 2, 4 and 6 are reported to be "some seats only" variants of 1, 3
+# and 5, and slot 11 == 1 is reported to mean "Wi-Fi, tier unknown", but
+# none of those values occurs anywhere in the corpus. Nothing is inferred
+# from them: an unobserved slot yields None, never a guessed value.
+#
+# No slot in the corpus ever holds JSON ``false``, so every ``False`` this
+# decoder emits is an inference. Only one is made — see
+# ``in_seat_video`` in :func:`_parse_amenities`.
+
+#: Power slots whose flavour is confirmed.
+_POWER_SLOTS: dict[int, str] = {1: "plug_and_usb", 3: "plug", 5: "usb"}
+#: Every index in the power group, scanned in wire order. Includes the
+#: unobserved 2/4/6 "some seats" variants deliberately: the first *set*
+#: slot wins even when it is one we cannot label, so a payload that ever
+#: does set one yields "unknown" rather than skipping ahead to a slot we
+#: can name and reporting something Google did not say.
+_POWER_GROUP: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
+#: Video slots, in wire order (first match wins).
+_VIDEO_SLOTS: dict[int, str] = {8: "live_tv", 9: "on_demand", 10: "stream_to_device"}
+#: Video products delivered on a seatback screen rather than to a phone.
+_SEATBACK_VIDEO = frozenset({"live_tv", "on_demand"})
+#: Position of the Wi-Fi tier code within ``leg[12]``.
+_WIFI_TIER_SLOT = 11
+#: Confirmed Wi-Fi tier codes.
+_WIFI_TIERS: dict[int, str] = {2: "free", 3: "paid"}
+#: Confirmed ``leg[13]`` seat-quality codes. Code 9 ("angled flat") is
+#: reported but unobserved, so it deliberately has no label here.
+_SEAT_QUALITY: dict[int, str] = {
+    1: "average",
+    2: "below_average",
+    3: "above_average",
+    4: "extra_reclining",
+    5: "lie_flat",
+    6: "lie_flat_suite_with_door",
+    8: "recliner",
+}
+
+
+def _slot_on(slots: Any, index: int) -> bool:
+    """Return True when ``slots[index]`` is a set flag.
+
+    Google's RPC payload encodes these flags as JSON booleans while the
+    public travel page encodes the same fields as ``1``; accept both and
+    treat every other value (including ``0`` and strings) as unset.
+    """
+    value = safe_get(slots, index)
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, int) and value > 0
+
+
+def _first_slot(slots: Any, indexes: Any) -> int | None:
+    """Return the first index in ``indexes`` whose slot is set, else None."""
+    return next((i for i in indexes if _slot_on(slots, i)), None)
+
+
+def _parse_legroom_inches(*legroom_strings: Any) -> int | None:
+    """Pull the integer seat pitch out of ``"31 in"`` / ``"31 inches"``.
+
+    ``str.isdigit()`` alone is not a safe guard: it is True for
+    superscripts like ``"²"``, which ``int()`` then rejects with a
+    ValueError. This runs inside :func:`_parse_leg`, so that exception
+    would propagate out of :func:`parse_flight_row` and silently drop the
+    entire flight row. Restrict to plain ASCII digits, which also keeps
+    this identical to the TypeScript port's ASCII-only regex.
+    """
+    for text in legroom_strings:
+        if not isinstance(text, str):
+            continue
+        head = text.split(" ", 1)[0]
+        if head.isascii() and head.isdigit():
+            inches = int(head)
+            if inches > 0:
+                return inches
+    return None
+
+
+def _parse_amenities(slots: Any, seat_quality: Any = None, legroom: Any = None) -> Amenities | None:
+    """Decode amenities at ``leg[12]``, seat quality at ``leg[13]``, pitch at ``leg[14]``.
+
+    ``leg[12][11]`` is the Wi-Fi tier, not a legroom rating, and slot 1 is
+    a power flag rather than Wi-Fi — see ``_POWER_SLOTS`` above. Seat
+    quality and legroom may be present even when the amenities array is
+    missing.
+
+    Return None when no source carries a usable value.
+    """
+    # Only a slot whose meaning the corpus confirms may set ``power``; an
+    # unlabelled slot (2/4/6, never observed) leaves every power field
+    # unknown rather than asserting "there is power, flavour unknown".
+    power_slot = _first_slot(slots, _POWER_GROUP)
+    power_type = _POWER_SLOTS.get(power_slot) if power_slot is not None else None
+    power = True if power_type is not None else None
+    # ``power_type == "plug"`` is the AC-outlet-only variant, but it rests
+    # on 7 legs from 2 carriers in the whole corpus — far too thin to put
+    # a False on a public tri-state. The distinction survives losslessly
+    # in ``power_type``; ``usb_power`` only ever says True or "unknown".
+    usb_power = True if power_type in ("plug_and_usb", "usb") else None
+
+    video_slot = _first_slot(slots, _VIDEO_SLOTS)
+    video_type = _VIDEO_SLOTS.get(video_slot) if video_slot is not None else None
+    # INFERENCE: "stream to your own device" is Google's way of saying the
+    # aircraft has no seatback screen — true of every slot-10 fleet in the
+    # corpus (Alaska, AA 737/A321 Sharklets, every regional jet) — so it
+    # is the one negative these slots license. Nothing else is inferred:
+    # a live-TV seatback normally carries on-demand content too, and
+    # streamed content is itself on-demand, so the absence of slot 9 is
+    # not evidence that on-demand is unavailable.
+    in_seat_video = None if video_type is None else video_type in _SEATBACK_VIDEO
+    on_demand_video = True if video_type == "on_demand" else None
+
+    wifi_code = as_non_negative_int(safe_get(slots, _WIFI_TIER_SLOT))
+    wifi = True if wifi_code else None
+    wifi_tier = _WIFI_TIERS.get(wifi_code) if wifi_code else None
+
+    legroom_rating = as_non_negative_int(seat_quality)
+    seat_quality_label = _SEAT_QUALITY.get(legroom_rating) if legroom_rating is not None else None
+    # ``legroom_inches`` is derived from a string the leg already exposes
+    # as ``legroom``/``legroom_short``, so on its own it is not enough to
+    # materialise an Amenities object — that keeps "no amenities" meaning
+    # the same thing it did before this decoder was corrected.
+    if wifi is None and power is None and video_type is None and legroom_rating is None:
+        return None
+    legroom_inches = _parse_legroom_inches(legroom)
     return Amenities(
         wifi=wifi,
         power=power,
-        usb_power=None,
-        in_seat_video=None,
+        usb_power=usb_power,
+        in_seat_video=in_seat_video,
         on_demand_video=on_demand_video,
         legroom_rating=legroom_rating,
+        wifi_tier=wifi_tier,
+        power_type=power_type,
+        video_type=video_type,
+        seat_quality=seat_quality_label,
+        legroom_inches=legroom_inches,
     )
 
 
@@ -275,10 +417,17 @@ def _parse_datetime(date_arr: list[int], time_arr: list[int]) -> datetime:
 
 # Airline / Airport enums are immutable so each code maps to a single
 # member instance — cache the ``getattr`` walk so the parse hot path
-# turns into a dict lookup. ``__members__`` is itself a dict, but going
-# through ``getattr`` adds attribute-protocol overhead we don't need.
-_AIRLINE_BY_CODE: dict[str, Airline] = {m.name: m for m in Airline}
-_AIRPORT_BY_CODE: dict[str, Airport] = {m.name: m for m in Airport}
+# turns into a dict lookup. Built from ``__members__`` (not ``for m in
+# Airline``/``for m in Airport``) so every registered name resolves, even
+# an alias: iterating the Enum itself silently skips alias members (two
+# codes sharing the same human-readable name collapse into one Enum
+# value), which used to make codes like Okinawa's ``OKA`` disappear from
+# this dict entirely and get dropped as "unknown code". The generator now
+# disambiguates duplicate names so aliases shouldn't occur in practice,
+# but building from ``__members__`` keeps this dict correct even if that
+# invariant is ever violated.
+_AIRLINE_BY_CODE: dict[str, Airline] = dict(Airline.__members__)
+_AIRPORT_BY_CODE: dict[str, Airport] = dict(Airport.__members__)
 
 
 def _parse_airline(code: str) -> Airline:
@@ -468,3 +617,169 @@ def _extract_fare_name(row: list) -> str | None:
         if isinstance(label, str) and label:
             return label
     return None
+
+
+# ---------------------------------------------------------------------------
+# Explore (GetExploreDestinations) decoding
+# ---------------------------------------------------------------------------
+#
+# One GetExploreDestinations HTTP response streams SEVERAL ``wrb.fr`` chunks:
+# destination chunks carry geo/name/image records at chunk[3][0] plus response
+# metadata, price chunks carry fare records at chunk[4][0]. Large regions
+# split both kinds across many chunks (24 observed for Oceania), and chunk
+# order is not guaranteed — callers must classify every chunk by shape and
+# accumulate, then left-join prices onto destinations on the knowledge-graph
+# mid at record[0].
+
+
+def _get_path(node: Any, *path: int) -> Any:
+    """Chain :func:`safe_get` over a positional path."""
+    for idx in path:
+        node = safe_get(node, idx)
+    return node
+
+
+def _is_mid(v: Any) -> bool:
+    return isinstance(v, str) and v.startswith(KG_MID_PREFIXES)
+
+
+def _as_float(v: Any) -> float | None:
+    if isinstance(v, bool):
+        return None
+    return float(v) if isinstance(v, int | float) else None
+
+
+def _explore_destination_records(chunk: Any) -> list:
+    """Return the destination records in a chunk (may be empty)."""
+    records = _get_path(chunk, 3, 0)
+    if not isinstance(records, list):
+        return []
+    return [
+        r
+        for r in records
+        if isinstance(r, list) and _is_mid(safe_get(r, 0)) and as_str(safe_get(r, 2))
+    ]
+
+
+def _explore_price_records(chunk: Any) -> list:
+    """Return the price records in a chunk (may be empty)."""
+    records = _get_path(chunk, 4, 0)
+    if not isinstance(records, list):
+        return []
+    return [r for r in records if isinstance(r, list) and _is_mid(safe_get(r, 0))]
+
+
+def is_explore_destinations_chunk(chunk: Any) -> bool:
+    """Return True when the chunk carries Explore destination records."""
+    return bool(_explore_destination_records(chunk))
+
+
+def is_explore_prices_chunk(chunk: Any) -> bool:
+    """Return True when the chunk carries Explore price records."""
+    return bool(_explore_price_records(chunk))
+
+
+def parse_explore_destinations_chunk(chunk: Any) -> tuple[dict[str, Any], list[ExploreDestination]]:
+    """Decode a destinations chunk into (metadata, partial destinations).
+
+    The returned :class:`ExploreDestination` objects carry only the
+    destination-side fields; price-side fields are filled in later by
+    :func:`merge_explore_payloads`. Malformed records are skipped with a
+    logged warning, mirroring :func:`parse_flight_row`'s philosophy.
+    """
+    meta: dict[str, Any] = {
+        "region_name": as_str(_get_path(chunk, 2, 0)),
+        "origin_name": as_str(_get_path(chunk, 6, 0, 0)),
+        "price_slider_min": _as_float(_get_path(chunk, 5, 0, 0, 1)),
+        "price_slider_max": _as_float(_get_path(chunk, 5, 0, 1, 1)),
+    }
+
+    destinations: list[ExploreDestination] = []
+    for record in _explore_destination_records(chunk):
+        try:
+            destinations.append(
+                ExploreDestination(
+                    mid=record[0],
+                    name=record[2],
+                    country=as_str(safe_get(record, 4)),
+                    latitude=_as_float(_get_path(record, 1, 0)),
+                    longitude=_as_float(_get_path(record, 1, 1)),
+                    thumbnail_url=as_str(safe_get(record, 3)),
+                    hero_image_url=as_str(safe_get(record, 7)),
+                    departure_date=as_str(safe_get(record, 11)),
+                    arrival_date=as_str(safe_get(record, 28)),
+                )
+            )
+        except (ValueError, TypeError, IndexError):
+            logger.warning("Skipping malformed explore destination record", exc_info=True)
+    return meta, destinations
+
+
+def parse_explore_prices_chunk(
+    chunk: Any, default_currency: str | None = None
+) -> dict[str, dict[str, Any]]:
+    """Decode a prices chunk into ``{mid: price fields}``.
+
+    Records without a numeric fare (Google keeps a placeholder row when no
+    itinerary satisfies the filters) are omitted, so destinations they refer
+    to surface as unpriced after the merge, as are records whose fare is
+    negative or not finite.
+    """
+    prices: dict[str, dict[str, Any]] = {}
+    for record in _explore_price_records(chunk):
+        price = _as_float(_get_path(record, 1, 0, 1))
+        if price is None or not math.isfinite(price) or price < 0:
+            continue
+        token = as_str(_get_path(record, 1, 1))
+        summary = safe_get(record, 6)
+        duration = as_int(_get_path(summary, 3))
+        prices[record[0]] = {
+            "price": price,
+            "currency": extract_currency_from_price_token(token) or default_currency,
+            "booking_token": token,
+            "airline": as_str(_get_path(summary, 0)),
+            "airline_name": as_str(_get_path(summary, 1)),
+            "stops": as_non_negative_int(_get_path(summary, 2)),
+            "duration_minutes": duration if duration and duration > 0 else None,
+            "layover_minutes": as_non_negative_int(_get_path(summary, 8)),
+            "destination_airport": as_str(_get_path(summary, 5)),
+            "origin_mid": as_str(_get_path(summary, 6)),
+        }
+    return prices
+
+
+def _apply_explore_price(dest: ExploreDestination, fields: dict[str, Any]) -> ExploreDestination:
+    """Merge price fields onto a destination through the model's own validation.
+
+    ``model_copy(update=...)`` would skip validation, so a bad field from
+    Google would slip past :class:`ExploreDestination`'s constraints. A record
+    that fails validation leaves the destination unpriced instead.
+    """
+    try:
+        return ExploreDestination.model_validate({**dest.model_dump(), **fields})
+    except ValueError:
+        logger.warning("Skipping malformed explore price record for %s", dest.mid, exc_info=True)
+        return dest
+
+
+def merge_explore_payloads(
+    meta: dict[str, Any],
+    destinations: list[ExploreDestination],
+    prices: dict[str, dict[str, Any]],
+) -> ExploreResult:
+    """Left-join price fields onto destinations and build the final result.
+
+    Destinations without a matching price record are kept with
+    ``price=None`` — a typical response prices only ~75% of destinations.
+    """
+    merged = [
+        _apply_explore_price(dest, prices[dest.mid]) if dest.mid in prices else dest
+        for dest in destinations
+    ]
+    return ExploreResult(
+        region_name=meta.get("region_name"),
+        origin_name=meta.get("origin_name"),
+        price_slider_min=meta.get("price_slider_min"),
+        price_slider_max=meta.get("price_slider_max"),
+        destinations=merged,
+    )

@@ -29,6 +29,24 @@ describe("Airport enum", () => {
   test("enum covers >7000 codes", () => {
     expect(Object.keys(AIRPORT_NAMES).length).toBeGreaterThan(7000);
   });
+  test("display names are disambiguated to match the Python package", () => {
+    // data/airports.csv gives OKA (Okinawa, Japan) and NAH (Naha,
+    // Indonesia) the same raw name ("Naha Airport"). The Python Airport
+    // enum disambiguates duplicate names by appending " (CODE)" so every
+    // Enum member stays distinct; AIRPORT_NAMES must carry the same
+    // suffixed names so the two packages' display output matches.
+    expect(AIRPORT_NAMES.OKA).toBe("Naha Airport (OKA)");
+    expect(AIRPORT_NAMES.NAH).toBe("Naha Airport (NAH)");
+    expect(AIRPORT_NAMES.OKA).not.toBe(AIRPORT_NAMES.NAH);
+
+    expect(AIRPORT_NAMES.TRI).toBe("Tri-Cities Airport (TRI)");
+    expect(AIRPORT_NAMES.PSC).toBe("Tri-Cities Airport (PSC)");
+    expect(AIRPORT_NAMES.TRI).not.toBe(AIRPORT_NAMES.PSC);
+
+    expect(AIRPORT_NAMES.NTL).toBe("Newcastle Airport (NTL)");
+    expect(AIRPORT_NAMES.NCL).toBe("Newcastle Airport (NCL)");
+    expect(AIRPORT_NAMES.NTL).not.toBe(AIRPORT_NAMES.NCL);
+  });
 });
 
 describe("Airline enum", () => {
@@ -49,6 +67,12 @@ describe("Airline enum", () => {
   test("AIRLINE_NAMES carries the name", () => {
     expect(AIRLINE_NAMES.AA).toBe("American Airlines");
     expect(AIRLINE_NAMES.BA).toBe("British Airways");
+  });
+  test("H4 is HiSky Europe", () => {
+    // Google returns H4 for HiSky Europe (e.g. Brussels-Bucharest). A code
+    // missing here makes parseLeg reject the leg, dropping the whole row.
+    expect(Airline.H4).toBe("H4");
+    expect(AIRLINE_NAMES.H4).toBe("HiSky Europe");
   });
   test("CSV-quoted names with embedded commas are unquoted", () => {
     // These three rows in data/airlines.csv use RFC4180 quoting because the

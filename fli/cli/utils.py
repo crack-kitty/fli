@@ -6,7 +6,6 @@ from typing import Any
 
 import plotext as plt
 import typer
-from click import Context, Parameter
 from rich import box
 from rich.console import Group
 from rich.panel import Panel
@@ -15,15 +14,17 @@ from rich.text import Text
 
 from fli.cli.console import console
 from fli.cli.enums import DayOfWeek
-from fli.core import format_price, format_price_axis_label
+from fli.core import format_price, format_price_axis_label, google_flights_url
 from fli.core.builders import normalize_date
 from fli.core.parsers import ParseError
 from fli.core.parsers import parse_airlines as core_parse_airlines
 from fli.core.parsers import parse_max_stops as core_parse_max_stops
-from fli.models import Airline, Airport, MaxStops, TripType
+from fli.models import Airline, Airport, MaxStops, TripType, display_name
 
 
-def validate_currency(ctx: Context, param: Parameter, value: str | None) -> str | None:
+def validate_currency(
+    ctx: typer.Context, param: typer.CallbackParam, value: str | None
+) -> str | None:
     """Validate currency code format for typer callbacks."""
     if value is None:
         return None
@@ -33,7 +34,7 @@ def validate_currency(ctx: Context, param: Parameter, value: str | None) -> str 
     return normalized
 
 
-def validate_date(ctx: Context, param: Parameter, value: str) -> str | None:
+def validate_date(ctx: typer.Context, param: typer.CallbackParam, value: str) -> str | None:
     """Validate date format for typer callbacks."""
     if value is None:
         return None
@@ -45,7 +46,7 @@ def validate_date(ctx: Context, param: Parameter, value: str) -> str | None:
 
 
 def validate_time_range(
-    ctx: Context, param: Parameter, value: str | None
+    ctx: typer.Context, param: typer.CallbackParam, value: str | None
 ) -> tuple[int, int] | None:
     """Validate and parse time range in format 'start-end' (24h format) for typer callbacks."""
     if not value:
@@ -160,8 +161,8 @@ def filter_dates_by_days(dates: list, days: list[DayOfWeek], trip_type: TripType
 
 
 def format_airport(airport: Airport) -> str:
-    """Format airport code and name (first two words)."""
-    name_parts = airport.value.split()[:3]  # Get first three words
+    """Format airport code and name (first three words)."""
+    name_parts = display_name(airport).split()[:3]  # Get first three words
     name = " ".join(name_parts)
     return f"{airport.name} ({name})"
 
@@ -175,12 +176,12 @@ def format_duration(minutes: int) -> str:
 
 def serialize_airport(airport: Airport) -> dict[str, str]:
     """Serialize an airport for machine-readable output."""
-    return {"code": airport.name, "name": airport.value}
+    return {"code": airport.name, "name": display_name(airport)}
 
 
 def serialize_airline(airline: Airline) -> dict[str, str]:
     """Serialize an airline for machine-readable output."""
-    return {"code": airline.name.removeprefix("_"), "name": airline.value}
+    return {"code": airline.name.removeprefix("_"), "name": display_name(airline)}
 
 
 def serialize_flight_leg(leg: Any) -> dict[str, Any]:
@@ -198,6 +199,9 @@ def serialize_flight_leg(leg: Any) -> dict[str, Any]:
         payload["aircraft"] = leg.aircraft
     if getattr(leg, "legroom", None):
         payload["legroom"] = leg.legroom
+    cabin_name = getattr(getattr(leg, "cabin", None), "name", None)
+    if isinstance(cabin_name, str):
+        payload["cabin"] = cabin_name
     if getattr(leg, "overnight", False):
         payload["overnight"] = True
     if getattr(leg, "operating_airline", None) is not None:
@@ -232,7 +236,6 @@ def _serialize_flight_segment_result(
     for src in (
         "self_transfer",
         "mixed_cabin",
-        "booking_token",
     ):
         v = getattr(flight, src, None)
         if v is not None and v != "":
@@ -253,19 +256,24 @@ def _serialize_flight_segment_result(
 def serialize_flight_result(
     flight_data: Any,
     default_currency: str = "USD",
+    *,
+    booking_url: str | None = None,
 ) -> dict[str, Any]:
     """Serialize a flight result or round-trip/multi-city tuple for JSON output."""
     if not isinstance(flight_data, tuple):
-        return _serialize_flight_segment_result(
+        out = _serialize_flight_segment_result(
             flight_data, include_price=True, default_currency=default_currency
         )
+        if booking_url:
+            out["booking_url"] = booking_url
+        return out
 
     segments = list(flight_data)
 
     if len(segments) == 2:
         # Round-trip: Google Flights returns the full RT price on the outbound leg.
         outbound, return_flight = segments
-        return {
+        out = {
             "price": outbound.price,
             "currency": outbound.currency or default_currency,
             "duration": outbound.duration + return_flight.duration,
@@ -273,32 +281,60 @@ def serialize_flight_result(
             "outbound": _serialize_flight_segment_result(outbound),
             "return": _serialize_flight_segment_result(return_flight),
         }
+        if booking_url:
+            out["booking_url"] = booking_url
+        return out
 
     # Multi-city (3+ legs): combined price is on the final leg.
     price_segment = segments[-1]
-    return {
+    out = {
         "price": price_segment.price,
         "currency": price_segment.currency or default_currency,
         "duration": sum(s.duration for s in segments),
         "stops": sum(s.stops for s in segments),
         "segments": [_serialize_flight_segment_result(s) for s in segments],
     }
+    if booking_url:
+        out["booking_url"] = booking_url
+    return out
 
 
 def serialize_date_result(
     date_result: Any,
     trip_type: TripType,
     default_currency: str = "USD",
+    *,
+    origin: str | None = None,
+    destination: str | None = None,
+    currency: str | None = None,
+    language: str | None = None,
+    country: str | None = None,
 ) -> dict[str, Any]:
-    """Serialize a date search result for JSON output."""
+    """Serialize a date search result for JSON output.
+
+    When ``origin`` and ``destination`` are provided, a ``booking_url``
+    deep-linking to Google Flights for that specific date is included.
+    """
+    departure_date = date_result.date[0].date().isoformat()
+    return_date = None
+    if trip_type == TripType.ROUND_TRIP and len(date_result.date) > 1:
+        return_date = date_result.date[1].date().isoformat()
     payload = {
-        "departure_date": date_result.date[0].date().isoformat(),
-        "return_date": None,
+        "departure_date": departure_date,
+        "return_date": return_date,
         "price": date_result.price,
         "currency": date_result.currency or default_currency,
     }
-    if trip_type == TripType.ROUND_TRIP and len(date_result.date) > 1:
-        payload["return_date"] = date_result.date[1].date().isoformat()
+    if origin and destination:
+        payload["booking_url"] = google_flights_url(
+            origin,
+            destination,
+            departure_date,
+            return_date,
+            currency=currency,
+            language=language,
+            country=country,
+        )
     return payload
 
 
@@ -309,9 +345,16 @@ def build_json_success_response(
     query: dict[str, Any],
     results_key: str,
     results: list[dict[str, Any]],
+    booking_url: str | None = None,
+    note: str | None = None,
 ) -> dict[str, Any]:
-    """Build a JSON success payload for CLI commands."""
-    return {
+    """Build a JSON success payload for CLI commands.
+
+    ``note`` is an optional explanatory string (e.g. the sparse-passenger-mix
+    hint on an empty result) — additive, like ``booking_url``, so callers that
+    don't pass it see no shape change.
+    """
+    payload: dict[str, Any] = {
         "success": True,
         "data_source": "google_flights",
         "search_type": search_type,
@@ -320,6 +363,11 @@ def build_json_success_response(
         "count": len(results),
         results_key: results,
     }
+    if booking_url:
+        payload["booking_url"] = booking_url
+    if note:
+        payload["note"] = note
+    return payload
 
 
 def build_json_error_response(
@@ -327,9 +375,17 @@ def build_json_error_response(
     search_type: str,
     message: str,
     error_type: str = "validation_error",
+    retryable: bool = False,
+    http_status: int | None = None,
     query: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build a JSON error payload for CLI commands."""
+    """Build a JSON error payload for CLI commands.
+
+    ``retryable`` and (when known) ``http_status`` mirror the MCP tools'
+    error responses — both come from the same
+    :func:`fli.core.errors.classify_error`, typically passed straight
+    through via ``**classify_error(exc).as_fields()`` at the call site.
+    """
     payload = {
         "success": False,
         "data_source": "google_flights",
@@ -337,8 +393,11 @@ def build_json_error_response(
         "error": {
             "type": error_type,
             "message": message,
+            "retryable": retryable,
         },
     }
+    if http_status is not None:
+        payload["error"]["http_status"] = http_status
     if query is not None:
         payload["query"] = query
     return payload
@@ -350,7 +409,11 @@ def emit_json(payload: dict[str, Any]) -> None:
 
 
 def display_flight_results(
-    flights: list, trip_type: TripType = TripType.ONE_WAY, default_currency: str = "USD"
+    flights: list,
+    trip_type: TripType = TripType.ONE_WAY,
+    default_currency: str = "USD",
+    booking_url: str | None = None,
+    booking_urls: list[str | None] | None = None,
 ):
     """Display flight results in a beautiful format.
 
@@ -359,6 +422,11 @@ def display_flight_results(
             or tuples of FlightResults (round-trip or multi-city)
         trip_type: The trip type to correctly interpret pricing.
         default_currency: Fallback currency code when Google does not return one.
+        booking_url: Optional search-level Google Flights deep link shown as a
+            footer so the user can open and browse the full search results.
+        booking_urls: Optional per-flight booking deep-link URLs aligned with
+            ``flights``.  When provided, a clickable "Book" row is added to
+            each flight's info table.
 
     """
     if not flights:
@@ -395,6 +463,12 @@ def display_flight_results(
             table.add_row("Self transfer", "yes (separate tickets)")
         if price_segment.mixed_cabin:
             table.add_row("Mixed cabin", "yes")
+
+        # Per-flight booking deep-link (when available)
+        if booking_urls is not None and i - 1 < len(booking_urls):
+            burl = booking_urls[i - 1]
+            if burl:
+                table.add_row("Book", f"[link={burl}]{burl}[/link]")
 
         # Create segments tables for each direction
         all_segments = []
@@ -464,8 +538,29 @@ def display_flight_results(
         )
         console.print()
 
+    if booking_url:
+        console.print(
+            Panel(
+                Text(booking_url, style="cyan"),
+                title="[bold]Open on Google Flights[/bold]",
+                border_style="cyan",
+                box=box.ROUNDED,
+            )
+        )
+        console.print()
 
-def display_date_results(dates: list, trip_type: TripType, default_currency: str = "USD"):
+
+def display_date_results(
+    dates: list,
+    trip_type: TripType,
+    default_currency: str = "USD",
+    *,
+    origin: str | None = None,
+    destination: str | None = None,
+    currency: str | None = None,
+    language: str | None = None,
+    country: str | None = None,
+):
     """Display date search results with sparkline chart and table."""
     if not dates:
         console.print(Panel("No flights found for these dates", style="red"))
@@ -500,8 +595,37 @@ def display_date_results(dates: list, trip_type: TripType, default_currency: str
 
     console.print()  # Add spacing between chart and table
 
+    # When the route is known, render each departure date as a clickable
+    # Google Flights deep link (rich hyperlink — keeps the table narrow while
+    # still letting the user jump straight to that date's flights).
+    links_enabled = bool(origin and destination)
+
+    def _departure_cell(date_price: Any) -> str:
+        label = date_price.date[0].strftime("%Y-%m-%d")
+        if not links_enabled:
+            return label
+        return_date = (
+            date_price.date[1].date().isoformat()
+            if trip_type == TripType.ROUND_TRIP and len(date_price.date) > 1
+            else None
+        )
+        url = google_flights_url(
+            origin,
+            destination,
+            date_price.date[0].date().isoformat(),
+            return_date,
+            currency=currency,
+            language=language,
+            country=country,
+        )
+        return f"[link={url}]{label}[/link]"
+
     # Build the table (using original order, not sorted)
-    table = Table(title="Cheapest Dates to Fly", box=box.ROUNDED)
+    table = Table(
+        title="Cheapest Dates to Fly",
+        caption="Departure dates link to Google Flights" if links_enabled else None,
+        box=box.ROUNDED,
+    )
     table.add_column("Departure", style="cyan")
     table.add_column("Day", style="yellow")
     if trip_type == TripType.ROUND_TRIP:
@@ -512,13 +636,13 @@ def display_date_results(dates: list, trip_type: TripType, default_currency: str
     for date_price in dates:
         if trip_type == TripType.ONE_WAY:
             table.add_row(
-                date_price.date[0].strftime("%Y-%m-%d"),
+                _departure_cell(date_price),
                 date_price.date[0].strftime("%A"),
                 format_price(date_price.price, date_price.currency or default_currency),
             )
         else:
             table.add_row(
-                date_price.date[0].strftime("%Y-%m-%d"),
+                _departure_cell(date_price),
                 date_price.date[0].strftime("%A"),
                 date_price.date[1].strftime("%Y-%m-%d"),
                 date_price.date[1].strftime("%A"),
